@@ -1,5 +1,5 @@
 import type { Readable, Writable } from "stream";
-import { SidebandBufferSerializer } from "./plugin/buffer-serializer";
+import { SidebandBufferSerializer } from "./rpc-buffer-serializer";
 import { RpcPeer } from "./rpc";
 
 export function createDuplexRpcPeer(selfName: string, peerName: string, readable: Readable, writable: Writable) {
@@ -10,7 +10,7 @@ export function createDuplexRpcPeer(selfName: string, peerName: string, readable
             serializer.sendMessage(message, reject, serializationContext);
         }
         catch (e) {
-            reject?.(e);
+            reject?.(e as Error);
             readable.destroy();
         }
     });
@@ -54,6 +54,7 @@ export function createRpcSerializer(options: {
     const setupRpcPeer = (peer: RpcPeer) => {
         rpcPeer = peer;
         rpcPeer.addSerializer(Buffer, 'Buffer', new SidebandBufferSerializer());
+        rpcPeer.constructorSerializerMap.set(Uint8Array, 'Buffer');
     }
 
     const onMessageBuffer = (buffer: Buffer) => {
@@ -68,9 +69,14 @@ export function createRpcSerializer(options: {
         const messageSerializationContext = pendingSerializationContext;
         pendingSerializationContext = undefined;
         rpcPeer.handleMessage(message, messageSerializationContext);
-    }
+    };
+
+    const kill = (message: string) => {
+        rpcPeer.kill(message);
+    };
 
     return {
+        kill,
         sendMessage,
         setupRpcPeer,
         onMessageBuffer,
@@ -106,42 +112,61 @@ export function createRpcDuplexSerializer(writable: {
 
     let header: Buffer;
     let pending: Buffer;
-
-    const readPending = (length: number) => {
-        if (!pending || pending.length < length)
-            return;
-
-        const ret = pending.slice(0, length);
-        pending = pending.slice(length);
-        if (!pending.length)
-            pending = undefined;
-        return ret;
-    }
+    let offset: number;
+    let type: number;
 
     const onData = (data: Buffer) => {
-        if (!pending)
-            pending = data;
-        else
-            pending = Buffer.concat([pending, data]);
-
-        while (true) {
-            if (!header) {
-                header = readPending(5);
+        while (data.length) {
+            if (!pending) {
                 if (!header)
+                    header = data;
+                else
+                    header = Buffer.concat([header, data]);
+                if (header.length < 5)
                     return;
+
+                // slice is used below because in web environment,
+                // babel seems to return a Uint8Arrray when subarray is called.
+                data = header.slice(5);
+                // length includes type field.
+                const length = header.readUInt32BE(0) - 1;
+                type = header.readUInt8(4);
+                if (data.length >= length && type === 0) {
+                    // no need to alloc a buffer for this, since it can be immediately parsed
+                    // as json.
+                    pending = data.length === length ? data : data.slice(0, length);
+                    offset = length;
+                    data = data.slice(length);
+                }
+                else {
+                    pending = Buffer.alloc(length);
+                    offset = 0;
+                }
+                header = undefined;
             }
 
-            const length = header.readUInt32BE(0);
-            const type = header.readUInt8(4);
-            const payload: Buffer = readPending(length - 1);
-            if (!payload)
+            const need = pending.length - offset;
+            if (need) {
+                const sub = data.slice(0, need);
+                data = data.slice(need);
+                pending.set(sub, offset);
+                offset += sub.length;
+            }
+
+            if (offset !== pending.length)
                 return;
 
-            header = undefined;
+            const payload = pending;
+            pending = undefined;
 
             if (type === 0) {
-                const message = JSON.parse(payload.toString());
-                serializer.onMessageFinish(message);
+                try {
+                    const message = JSON.parse(payload.toString());
+                    serializer.onMessageFinish(message);
+                }
+                catch (e) {
+                    serializer.kill('message parse failure ' + (e as Error).message);
+                }
             }
             else {
                 serializer.onMessageBuffer(payload);

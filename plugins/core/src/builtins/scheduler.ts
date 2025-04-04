@@ -2,16 +2,15 @@ import { ScryptedDevice, EventListenerOptions, ScryptedDeviceBase } from "@scryp
 import { Listen } from "./listen";
 
 export interface Schedule {
-    clockType: "AM" | "PM" | "24HourClock" | "BeforeSunrise" | "BeforeSunset" | "AfterSunrise" | "AfterSunset";
-    friday: boolean;
     hour: number;
     minute: number;
-    monday: boolean
-    saturday: boolean
     sunday: boolean
-    thursday: boolean;
+    monday: boolean
     tuesday: boolean
     wednesday: boolean
+    thursday: boolean;
+    friday: boolean;
+    saturday: boolean
 }
 
 export class Scheduler {
@@ -26,36 +25,18 @@ export class Scheduler {
             schedule.saturday,
         ];
 
-        const date = new Date();
-        if (schedule.clockType === 'AM' || schedule.clockType === 'PM') {
-            let hour = schedule.hour;
-            if (schedule.clockType === 'AM') {
-                if (hour === 12)
-                    hour -= 12;
-            }
-            else {
-                if (hour != 12)
-                    hour += 12;
-            }
-            date.setHours(hour);
-            date.setMinutes(schedule.minute, 0, 0);
-        }
-        else if (schedule.clockType === '24HourClock') {
-            date.setHours(schedule.hour, schedule.minute, 0, 0);
-        }
-        else {
-            throw new Error('sunrise/sunset clock not supported');
-        }
-
-
-
         const ret: ScryptedDevice = {
             async setName() { },
             async setType() { },
             async setRoom() { },
-            async probe() { return true },
+            async setMixins() { },
+            async probe() { return true; },
             listen(event: EventListenerOptions, callback, source?: ScryptedDeviceBase) {
                 function reschedule(): Date {
+                    const date = new Date();
+                    date.setHours(schedule.hour);
+                    date.setMinutes(schedule.minute);
+
                     const now = Date.now();
                     for (let i = 0; i < 8; i++) {
                         const future = new Date(date.getTime() + i * 24 * 60 * 60 * 1000);
@@ -65,39 +46,53 @@ export class Scheduler {
                         const day = future.getDay();
                         if (!days[day])
                             continue;
-        
-                        source.log.i(`event will fire at ${future}`);
+
+                        source.log.i(`event will fire at ${future.toLocaleString()}`);
                         return future;
                     }
                     source.log.w('event will never fire');
                 }
 
-                const when = reschedule();
-                if (!when) {
-                    return {
-                        removeListener() {
-                        }
+                let timeout: NodeJS.Timeout = null;
+                let when: Date = null;
+
+                function timerCb() {
+                    timeout = null;
+                    const prevWhen = when;
+                    setupTimer();
+                    callback(ret, {
+                        eventId: undefined,
+                        eventInterface: 'Scheduler',
+                        eventTime: Date.now(),
+                    }, prevWhen);
+                }
+
+                function setupTimer() {
+                    when = reschedule();
+                    if (when) {
+                        const delay = when.getTime() - Date.now();
+                        source.log.i(`event will fire in ${Math.round(delay / 60 / 1000)} minutes.`);
+                        timeout = setTimeout(timerCb, delay);
                     }
                 }
 
-                const delay = when.getTime() - Date.now();
-
-                let timeout = setTimeout(() => {
-                    reschedule();
-
-                    callback(ret, {
-                        eventInterface: 'Scheduler',
-                        changed: true,
-                        eventTime: Date.now(),
-                    }, when)
-                }, delay);
+                setupTimer();
 
                 return {
                     removeListener() {
-                        clearTimeout(timeout);
+                        if (timeout) {
+                            clearTimeout(timeout);
+                        }
+                        timeout = null;
+                        when = null;
                     }
-                }
-            }
+                };
+            },
+            id: "",
+            pluginId: "",
+            interfaces: [],
+            mixins: [],
+            providedInterfaces: []
         }
 
         ret.name = 'Scheduler';

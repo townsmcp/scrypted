@@ -4,10 +4,10 @@ import { monacoEvalDefaults } from "./monaco";
 import { createScriptDevice, ScriptDeviceImpl } from "@scrypted/common/src/eval/scrypted-eval";
 import { ScriptCoreNativeId } from "./script-core";
 
-const { log, deviceManager, systemManager } = sdk;
+const { deviceManager } = sdk;
 
 export class Script extends ScryptedDeviceBase implements Scriptable, Program, ScriptDeviceImpl {
-    constructor(nativeId: string) {
+    constructor(nativeId: string, public triggerDeviceDiscover?: (name: string, type: ScryptedDeviceType | string, interfaces: string[]) => Promise<string>) {
         super(nativeId);
     }
 
@@ -15,6 +15,8 @@ export class Script extends ScryptedDeviceBase implements Scriptable, Program, S
         this.storage.setItem('data', JSON.stringify({
             'script.ts': source.script,
         }));
+
+        this.triggerDeviceDiscover?.(this.providedName, this.providedType, this.providedInterfaces);
     }
 
     async loadScripts(): Promise<{ [filename: string]: ScriptSource; }> {
@@ -73,13 +75,13 @@ export class Script extends ScryptedDeviceBase implements Scriptable, Program, S
         ]));
     }
 
-    async run(variables?: { [name: string]: any; }): Promise<any> {
+    async runInternal(script: string, variables?: { [name: string]: any; }): Promise<any> {
         this.prepareScript();
 
         try {
             const data = JSON.parse(this.storage.getItem('data'));
 
-            const { value, defaultExport } = await scryptedEval(this, data['script.ts'], Object.assign({
+            const { value, defaultExport } = await scryptedEval(this, script, Object.assign({
                 device: this,
             }, variables));
 
@@ -87,20 +89,18 @@ export class Script extends ScryptedDeviceBase implements Scriptable, Program, S
             return value;
         }
         catch (e) {
-            this.console.error('error loading script', e);
+            this.console.error('error evaluating script', e);
             throw e;
         }
     }
 
-    async eval(source: ScriptSource, variables: { [name: string]: any }) {
-        this.prepareScript();
+    async run(variables?: { [name: string]: any; }): Promise<any> {
+        const data = JSON.parse(this.storage.getItem('data'));
+        return this.runInternal(data['script.ts'], variables)
+    }
 
-        const { value, defaultExport } = await scryptedEval(this, source.script, Object.assign({
-            device: this,
-        }, variables));
-
-        await this.postRunScript(defaultExport);
-        return value;
+    async eval(source: ScriptSource, variables?: { [name: string]: any }) {
+        return this.runInternal(source.script, variables);
     }
 
     // will be done at runtime

@@ -1,19 +1,33 @@
 import crypto, { randomBytes } from 'crypto';
 import dgram from 'dgram';
-import { BASIC, DIGEST } from 'http-auth-utils/dist/index';
+import { once } from 'events';
 import net from 'net';
-import { Duplex, Readable } from 'stream';
+import { Duplex, Readable, Writable } from 'stream';
 import tls from 'tls';
-import { closeQuiet, createBindZero } from './listen-cluster';
+import { URL } from 'url';
+import { Deferred } from './deferred';
+import { closeQuiet, createBindZero, createSquentialBindZero, listenZeroSingleClient } from './listen-cluster';
 import { timeoutPromise } from './promise-utils';
 import { readLength, readLine } from './read-stream';
 import { MSection, parseSdp } from './sdp-utils';
 import { sleep } from './sleep';
 import { StreamChunk, StreamParser, StreamParserOptions } from './stream-parser';
 
+const REQUIRED_WWW_AUTHENTICATE_KEYS = ['realm', 'nonce'];
+
+type DigestWWWAuthenticateData = {
+    realm: string;
+    domain?: string;
+    nonce: string;
+    opaque?: string;
+    stale?: 'true' | 'false';
+    algorithm?: 'MD5' | 'MD5-sess' | 'token';
+    qop?: 'auth' | 'auth-int' | string;
+};
+
 export const RTSP_FRAME_MAGIC = 36;
 
-interface Headers {
+export interface Headers {
     [header: string]: string
 }
 
@@ -32,11 +46,39 @@ export async function readMessage(client: Readable): Promise<string[]> {
     }
 }
 
+
+export async function readBody(client: Readable, response: Headers) {
+    const cl = parseInt(response['content-length']);
+    if (cl)
+        return readLength(client, cl)
+}
+
+
+export function writeMessage(client: Writable, messageLine: string, body: Buffer, headers: Headers, console?: Console) {
+    let message = messageLine !== undefined ? `${messageLine}\r\n` : '';
+    if (body)
+        headers['Content-Length'] = body.length.toString();
+    for (const [key, value] of Object.entries(headers)) {
+        message += `${key}: ${value}\r\n`;
+    }
+    message += '\r\n';
+    client.write(message);
+    console?.log('rtsp outgoing message\n', message);
+    console?.log();
+    if (body)
+        client.write(body);
+}
+
 // https://yumichan.net/video-processing/video-compression/introduction-to-h264-nal-unit/
+
+export const H264_NAL_TYPE_RESERVED0 = 0;
+export const H264_NAL_TYPE_RESERVED30 = 30;
+export const H264_NAL_TYPE_RESERVED31 = 31;
 
 export const H264_NAL_TYPE_IDR = 5;
 export const H264_NAL_TYPE_SEI = 6;
 export const H264_NAL_TYPE_SPS = 7;
+export const H264_NAL_TYPE_PPS = 8;
 // aggregate NAL Unit
 export const H264_NAL_TYPE_STAP_A = 24;
 export const H264_NAL_TYPE_STAP_B = 25;
@@ -47,31 +89,74 @@ export const H264_NAL_TYPE_FU_B = 29;
 export const H264_NAL_TYPE_MTAP16 = 26;
 export const H264_NAL_TYPE_MTAP32 = 27;
 
+export const H265_NAL_TYPE_AGG = 48;
+export const H265_NAL_TYPE_VPS = 32;
+export const H265_NAL_TYPE_SPS = 33;
+export const H265_NAL_TYPE_PPS = 34;
+export const H265_NAL_TYPE_IDR_N = 19;
+export const H265_NAL_TYPE_IDR_W = 20;
+export const H265_NAL_TYPE_FU = 49;
+export const H265_NAL_TYPE_SEI_PREFIX = 39;
+export const H265_NAL_TYPE_SEI_SUFFIX = 40;
+
 export function findH264NaluType(streamChunk: StreamChunk, naluType: number) {
     if (streamChunk.type !== 'h264')
         return;
     return findH264NaluTypeInNalu(streamChunk.chunks[streamChunk.chunks.length - 1].subarray(12), naluType);
 }
 
+export function findH265NaluType(streamChunk: StreamChunk, naluType: number) {
+    if (streamChunk.type !== 'h265')
+        return;
+    return findH265NaluTypeInNalu(streamChunk.chunks[streamChunk.chunks.length - 1].subarray(12), naluType);
+}
+
+export function parseH264NaluType(firstNaluByte: number) {
+    return firstNaluByte & 0x1f;
+}
+
 export function findH264NaluTypeInNalu(nalu: Buffer, naluType: number) {
-    const checkNaluType = nalu[0] & 0x1f;
+    const checkNaluType = parseH264NaluType(nalu[0]);
     if (checkNaluType === H264_NAL_TYPE_STAP_A) {
         let pos = 1;
         while (pos < nalu.length) {
             const naluLength = nalu.readUInt16BE(pos);
             pos += 2;
-            const stapaType = nalu[pos] & 0x1f;
+            const stapaType = parseH264NaluType(nalu[pos]);
             if (stapaType === naluType)
                 return nalu.subarray(pos, pos + naluLength);
             pos += naluLength;
         }
     }
     else if (checkNaluType === H264_NAL_TYPE_FU_A) {
-        const fuaType = nalu[1] & 0x1f;
+        const fuaType = parseH264NaluType(nalu[1]);
         const isFuStart = !!(nalu[1] & 0x80);
 
         if (fuaType === naluType && isFuStart)
             return nalu.subarray(1);
+    }
+    else if (checkNaluType === naluType) {
+        return nalu;
+    }
+    return;
+}
+
+function parseH265NaluType(firstNaluByte: number) {
+    return (firstNaluByte & 0b01111110) >> 1;
+}
+
+export function findH265NaluTypeInNalu(nalu: Buffer, naluType: number) {
+    const checkNaluType = parseH265NaluType(nalu[0]);
+    if (checkNaluType === H265_NAL_TYPE_AGG) {
+        let pos = 1;
+        while (pos < nalu.length) {
+            const naluLength = nalu.readUInt16BE(pos);
+            pos += 2;
+            const stapaType = parseH265NaluType(nalu[pos]);
+            if (stapaType === naluType)
+                return nalu.subarray(pos, pos + naluLength);
+            pos += naluLength;
+        }
     }
     else if (checkNaluType === naluType) {
         return nalu;
@@ -87,21 +172,21 @@ export function getNaluTypes(streamChunk: StreamChunk) {
 
 export function getNaluTypesInNalu(nalu: Buffer, fuaRequireStart = false, fuaRequireEnd = false) {
     const ret = new Set<number>();
-    const naluType = nalu[0] & 0x1f;
+    const naluType = parseH264NaluType(nalu[0]);
     if (naluType === H264_NAL_TYPE_STAP_A) {
         ret.add(H264_NAL_TYPE_STAP_A);
         let pos = 1;
         while (pos < nalu.length) {
             const naluLength = nalu.readUInt16BE(pos);
             pos += 2;
-            const stapaType = nalu[pos] & 0x1f;
+            const stapaType = parseH264NaluType(nalu[pos]);
             ret.add(stapaType);
             pos += naluLength;
         }
     }
     else if (naluType === H264_NAL_TYPE_FU_A) {
         ret.add(H264_NAL_TYPE_FU_A);
-        const fuaType = nalu[1] & 0x1f;
+        const fuaType = parseH264NaluType(nalu[1]);
         if (fuaRequireStart) {
             const isFuStart = !!(nalu[1] & 0x80);
             if (isFuStart)
@@ -109,6 +194,50 @@ export function getNaluTypesInNalu(nalu: Buffer, fuaRequireStart = false, fuaReq
         }
         else if (fuaRequireEnd) {
             const isFuEnd = !!(nalu[1] & 0x40);
+            if (isFuEnd)
+                ret.add(fuaType);
+        }
+        else {
+            ret.add(fuaType);
+        }
+    }
+    else {
+        ret.add(naluType);
+    }
+
+    return ret;
+}
+
+export function getH265NaluTypes(streamChunk: StreamChunk) {
+    if (streamChunk.type !== 'h265')
+        return new Set<number>();
+    return getNaluTypesInH265Nalu(streamChunk.chunks[streamChunk.chunks.length - 1].subarray(12))
+}
+
+export function getNaluTypesInH265Nalu(nalu: Buffer, fuaRequireStart = false, fuaRequireEnd = false) {
+    const ret = new Set<number>();
+    const naluType = parseH265NaluType(nalu[0]);
+    if (naluType === H265_NAL_TYPE_AGG) {
+        ret.add(H265_NAL_TYPE_AGG);
+        let pos = 2;
+        while (pos < nalu.length) {
+            const naluLength = nalu.readUInt16BE(pos);
+            pos += 2;
+            const stapaType = parseH265NaluType(nalu[pos]);
+            ret.add(stapaType);
+            pos += naluLength;
+        }
+    }
+    else if (naluType === H265_NAL_TYPE_FU) {
+        ret.add(H265_NAL_TYPE_FU);
+        const fuaType = nalu[2] & 0x3F;  // 6 bits
+        if (fuaRequireStart) {
+            const isFuStart = !!(nalu[2] & 0x80);
+            if (isFuStart)
+                ret.add(fuaType);
+        }
+        else if (fuaRequireEnd) {
+            const isFuEnd = !!(nalu[2] & 0x40);
             if (isFuEnd)
                 ret.add(fuaType);
         }
@@ -138,50 +267,32 @@ export function createRtspParser(options?: StreamParserOptions): RtspStreamParse
             'tcp',
             ...(options?.vcodec || []),
             ...(options?.acodec || []),
+            // linux and windows seem to support 64000 but darwin is 32000?
+            '-pkt_size', '32000',
             '-f', 'rtsp',
         ],
         findSyncFrame(streamChunks: StreamChunk[]) {
-            let foundIndex: number;
-            let nonVideo: {
-                [codec: string]: StreamChunk,
-            } = {};
-
-            const createSyncFrame = () => {
-                const ret = streamChunks.slice(foundIndex);
-                // for (const nv of Object.values(nonVideo)) {
-                //     ret.unshift(nv);
-                // }
-                return ret;
-            }
-
             for (let prebufferIndex = 0; prebufferIndex < streamChunks.length; prebufferIndex++) {
                 const streamChunk = streamChunks[prebufferIndex];
-                if (streamChunk.type !== 'h264') {
-                    nonVideo[streamChunk.type] = streamChunk;
-                    continue;
+                if (streamChunk.type === 'h264') {
+                    const naluTypes = getNaluTypes(streamChunk);
+                    if (naluTypes.has(H264_NAL_TYPE_SPS) || naluTypes.has(H264_NAL_TYPE_IDR)) {
+                        return streamChunks.slice(prebufferIndex);
+                    }
                 }
+                else if (streamChunk.type === 'h265') {
+                    const naluTypes = getH265NaluTypes(streamChunk);
 
-                if (findH264NaluType(streamChunk, H264_NAL_TYPE_SPS))
-                    foundIndex = prebufferIndex;
-            }
-
-            if (foundIndex !== undefined)
-                return createSyncFrame();
-
-            nonVideo = {};
-            // some streams don't contain codec info, so find an idr frame instead.
-            for (let prebufferIndex = 0; prebufferIndex < streamChunks.length; prebufferIndex++) {
-                const streamChunk = streamChunks[prebufferIndex];
-                if (streamChunk.type !== 'h264') {
-                    nonVideo[streamChunk.type] = streamChunk;
-                    continue;
+                    if (naluTypes.has(H265_NAL_TYPE_VPS)
+                        || naluTypes.has(H265_NAL_TYPE_SPS)
+                        || naluTypes.has(H265_NAL_TYPE_PPS)
+                        || naluTypes.has(H265_NAL_TYPE_IDR_N)
+                        || naluTypes.has(H265_NAL_TYPE_IDR_W)
+                    ) {
+                        return streamChunks.slice(prebufferIndex);
+                    }
                 }
-                if (findH264NaluType(streamChunk, H264_NAL_TYPE_IDR))
-                    foundIndex = prebufferIndex;
             }
-
-            if (foundIndex !== undefined)
-                return createSyncFrame();
 
             // oh well!
         },
@@ -237,25 +348,34 @@ export function parseSemicolonDelimited(value: string) {
     return dict;
 }
 
+export interface RtspStatus {
+    line: string,
+    code: number,
+    version: string,
+    reason: string,
+}
+
+export interface RtspServerResponse {
+    headers: Headers;
+    body: Buffer;
+    status: RtspStatus;
+}
+
+export class RtspStatusError extends Error {
+    constructor(public status: RtspStatus) {
+        super(`RTSP Error: ${status.line}`);
+    }
+}
+
 export class RtspBase {
     client: net.Socket;
+    console?: Console;
 
-    constructor(public console?: Console) {
+    constructor() {
     }
 
     write(messageLine: string, headers: Headers, body?: Buffer) {
-        let message = `${messageLine}\r\n`;
-        if (body)
-            headers['Content-Length'] = body.length.toString();
-        for (const [key, value] of Object.entries(headers)) {
-            message += `${key}: ${value}\r\n`;
-        }
-        message += '\r\n';
-        this.client.write(message);
-        this.console?.log('rtsp outgoing message\n', message);
-        this.console?.log();
-        if (body)
-            this.client.write(body);
+        writeMessage(this.client, messageLine, body, headers, this.console);
     }
 
     async readMessage(): Promise<string[]> {
@@ -294,9 +414,10 @@ export class RtspClient extends RtspBase {
     setupOptions = new Map<number, RtspClientTcpSetupOptions>();
     issuedTeardown = false;
     hasGetParameter = true;
+    contentBase: string;
 
-    constructor(public url: string, console?: Console) {
-        super(console);
+    constructor(public readonly url: string) {
+        super();
         const u = new URL(url);
         const port = parseInt(u.port) || 554;
         if (url.startsWith('rtsps')) {
@@ -309,6 +430,9 @@ export class RtspClient extends RtspBase {
         else {
             this.client = net.connect(port, u.hostname);
         }
+        this.client.on('error', e => {
+            this.console?.log('client error', e);
+        });
     }
 
     async safeTeardown() {
@@ -328,16 +452,21 @@ export class RtspClient extends RtspBase {
         }
     }
 
-    writeRequest(method: string, headers?: Headers, path?: string, body?: Buffer) {
+    async writeRequest(method: string, headers?: Headers, path?: string, body?: Buffer) {
         headers = headers || {};
 
-        let fullUrl = this.url;
-        if (path) {
+        let fullUrl: string;
+        if (!path) {
+            fullUrl = this.url;
+        }
+        else {
             // a=control may be a full or "relative" url.
-            if (path.includes('rtsp://') || path.includes('rtsps://')) {
+            if (path.includes('rtsp://') || path.includes('rtsps://') || path === '*') {
                 fullUrl = path;
             }
             else {
+                fullUrl = this.contentBase || this.url;
+
                 // strangely, relative RTSP urls do not behave like expected from an HTTP-ish server.
                 // ffmpeg will happily suffix path segments after query strings:
                 // SETUP rtsp://localhost:5554/cam/realmonitor?channel=1&subtype=0/trackID=0 RTSP/1.0
@@ -355,7 +484,7 @@ export class RtspClient extends RtspBase {
         headers['User-Agent'] = 'Scrypted';
 
         if (this.wwwAuthenticate)
-            headers['Authorization'] = this.createAuthorizationHeader(method, new URL(fullUrl));
+            headers['Authorization'] = await this.createAuthorizationHeader(method, new URL(fullUrl));
 
         if (this.session)
             headers['Session'] = this.session;
@@ -381,7 +510,11 @@ export class RtspClient extends RtspBase {
         return this.handleDataPayload(header);
     }
 
-    async readLoop() {
+    createBadHeader(header: Buffer) {
+        return new Error('RTSP Client received invalid frame magic. This may be a bug in your camera firmware. If this error persists, switch your RTSP Parser to FFmpeg or Scrypted (UDP): ' + header.toString());
+    }
+
+    async readLoopLegacy() {
         try {
             while (true) {
                 if (this.needKeepAlive) {
@@ -395,9 +528,118 @@ export class RtspClient extends RtspBase {
             }
         }
         catch (e) {
-            this.client.destroy(e);
+            this.client.destroy(e as Error);
             throw e;
         }
+    }
+
+    async *handleStream(): AsyncGenerator<{
+        rtcp: boolean,
+        header: Buffer,
+        packet: Buffer,
+        channel: number,
+    }> {
+        while (true) {
+            const header = await readLength(this.client, 4);
+            // can this even happen? since the RTSP request method isn't a fixed
+            // value like the "RTSP" in the RTSP response, I don't think so?
+            if (header[0] !== RTSP_FRAME_MAGIC) {
+                if (header.toString() !== 'RTSP')
+                    throw this.createBadHeader(header);
+
+                this.client.unshift(header);
+
+                // do what with this?
+                const message = await super.readMessage();
+                const body = await this.readBody(parseHeaders(message));
+
+                continue;
+            }
+
+            const length = header.readUInt16BE(2);
+            const packet = await readLength(this.client, length);
+            const id = header.readUInt8(1);
+
+            yield {
+                channel: id,
+                rtcp: id % 2 === 1,
+                header,
+                packet,
+            }
+        }
+    }
+
+    async readLoop() {
+        const deferred = new Deferred<void>();
+
+        let header: Buffer;
+        let channel: number;
+        let length: number;
+
+        const read = async () => {
+            if (this.needKeepAlive) {
+                this.needKeepAlive = false;
+                if (this.hasGetParameter)
+                    this.writeGetParameter();
+                else
+                    this.writeOptions();
+            }
+
+            try {
+                while (true) {
+                    // get header if needed
+                    if (!header) {
+                        header = this.client.read(4);
+
+                        if (!header)
+                            return;
+
+                        // validate header once.
+                        if (header[0] !== RTSP_FRAME_MAGIC) {
+                            if (header.toString() !== 'RTSP')
+                                throw this.createBadHeader(header);
+
+                            this.client.unshift(header);
+                            header = undefined;
+
+                            // remove the listener to operate in pull mode.
+                            this.client.removeListener('readable', read);
+
+                            // do what with this?
+                            const message = await super.readMessage();
+                            const body = await this.readBody(parseHeaders(message));
+
+                            // readd the listener to operate in streaming mode.
+                            this.client.on('readable', read);
+
+                            continue;
+                        }
+
+                        channel = header.readUInt8(1);
+                        length = header.readUInt16BE(2);
+                    }
+
+                    const data = this.client.read(length);
+                    if (!data)
+                        return;
+
+                    const h = header;
+                    header = undefined;
+                    const options = this.setupOptions.get(channel);
+                    options?.onRtp?.(h, data);
+                }
+            }
+            catch (e) {
+                if (!deferred.finished)
+                    deferred.reject(e as Error);
+                this.client.destroy();
+            }
+        };
+
+        read();
+        this.client.on('readable', read);
+
+        await Promise.all([once(this.client, 'end')]);
     }
 
     // rtsp over tcp will actually interleave RTSP request/responses
@@ -407,32 +649,54 @@ export class RtspClient extends RtspBase {
     async readMessage(): Promise<string[]> {
         while (true) {
             const header = await readLength(this.client, 4);
-            if (header.toString() === 'RTSP') {
-                this.client.unshift(header);
-                const message = await super.readMessage();
-                return message;
+            if (header[0] !== RTSP_FRAME_MAGIC) {
+                if (header.toString() === 'RTSP') {
+                    this.client.unshift(header);
+                    const message = await super.readMessage();
+                    return message;
+                }
+                throw this.createBadHeader(header);
             }
 
             await this.handleDataPayload(header);
         }
     }
 
-    createAuthorizationHeader(method: string, url: URL) {
+    async createAuthorizationHeader(method: string, url: URL) {
         if (!this.wwwAuthenticate)
             throw new Error('no WWW-Authenticate found');
 
+        const { BASIC } = await import('http-auth-utils');
+        // @ts-ignore
+        const { parseHTTPHeadersQuotedKeyValueSet } = await import('http-auth-utils/dist/utils');
+
         if (this.wwwAuthenticate.includes('Basic')) {
-            const hash = BASIC.computeHash(url);
+            const parsedUrl = new URL(this.url);
+            const hash = BASIC.computeHash({ username: parsedUrl.username, password: parsedUrl.password });
             return `Basic ${hash}`;
         }
 
-        const wwwAuth = DIGEST.parseWWWAuthenticateRest(this.wwwAuthenticate);
+        // hikvision sends out of spec 'random' name and value parameter,
+        // which causes the digest auth lib to fail. so, need to parse the header
+        // manually with a relax set of authorized parameters.
+        // https://github.com/koush/scrypted/issues/344#issuecomment-1223627956
+        // https://github.com/nfroidure/http-auth-utils/blob/7532d21a419ad098d1240c9e1b55855020df5d7f/src/mechanisms/digest.ts#L97
+        // const wwwAuth = DIGEST.parseWWWAuthenticateRest(this.wwwAuthenticate);
+        const wwwAuth = parseHTTPHeadersQuotedKeyValueSet(
+            this.wwwAuthenticate,
+            // the parser will call indexOf to see if the key is authorized. monkey patch this call.
+            // https://github.com/nfroidure/http-auth-utils/blob/17186d3eefb86535916d044c7f59a340bc765603/src/utils.ts#L43
+            {
+                indexOf: () => 0,
+            } as any,
+            REQUIRED_WWW_AUTHENTICATE_KEYS,
+        ) as DigestWWWAuthenticateData;
 
         const authedUrl = new URL(this.url);
         const username = decodeURIComponent(authedUrl.username);
         const password = decodeURIComponent(authedUrl.password);
 
-        const strippedUrl = new URL(url);
+        const strippedUrl = new URL(url.toString());
         strippedUrl.username = '';
         strippedUrl.password = '';
 
@@ -453,17 +717,28 @@ export class RtspClient extends RtspBase {
         return `Digest ${paramsString}`;
     }
 
-    async request(method: string, headers?: Headers, path?: string, body?: Buffer, authenticating?: boolean): Promise<{
-        headers: Headers,
-        body: Buffer
-    }> {
-        this.writeRequest(method, headers, path, body);
+    async readBody(response: Headers) {
+        return readBody(this.client, response);
+    }
+
+    async request(method: string, headers?: Headers, path?: string, body?: Buffer, authenticating?: boolean): Promise<RtspServerResponse> {
+        await this.writeRequest(method, headers, path, body);
 
         const message = this.requestTimeout ? await timeoutPromise(this.requestTimeout, this.readMessage()) : await this.readMessage();
-        const status = message[0];
+        const statusLine = message[0];
+        const [version, codeString, reason] = statusLine.split(' ', 3);
+        const code = parseInt(codeString);
         const response = parseHeaders(message);
-        if (!status.includes('200') && !response['www-authenticate'])
-            throw new Error(status);
+
+        const status = {
+            line: statusLine,
+            code,
+            version,
+            reason,
+        };
+
+        if (code !== 200 && !response['www-authenticate'])
+            throw new RtspStatusError(status);
 
         // it seems that the first www-authenticate header should be used, as latter ones that are
         // offered are not actually valid? weird issue seen on tp-link that offers both DIGEST and BASIC.
@@ -476,10 +751,11 @@ export class RtspClient extends RtspBase {
 
             return this.request(method, headers, path, body, true);
         }
-        const cl = parseInt(response['content-length']);
-        if (cl)
-            return { headers: response, body: await readLength(this.client, cl) };
-        return { headers: response, body: undefined };
+        return {
+            headers: response,
+            body: await this.readBody(response),
+            status,
+        }
     }
 
     async options() {
@@ -488,6 +764,11 @@ export class RtspClient extends RtspBase {
         const publicHeader = ret.headers['public'];
         if (publicHeader)
             this.hasGetParameter = publicHeader.toLowerCase().includes('get_parameter');
+        return ret;
+    }
+
+    writeOptions() {
+        return this.writeRequest('OPTIONS');
     }
 
     async getParameter() {
@@ -499,14 +780,20 @@ export class RtspClient extends RtspBase {
     }
 
     async describe(headers?: Headers) {
-        return this.request('DESCRIBE', {
+        const response = await this.request('DESCRIBE', {
             ...(headers || {}),
             Accept: 'application/sdp',
         });
+
+        this.contentBase = response.headers['content-base'] || response.headers['content-location'];
+        // content base may be a relative path? seems odd.
+        if (this.contentBase)
+            this.contentBase = new URL(this.contentBase, this.url).toString();
+        return response;
     }
 
-    async setup(options: RtspClientTcpSetupOptions | RtspClientUdpSetupOptions) {
-        const protocol = options.type === 'udp' ? 'UDP' : 'TCP';
+    async setup(options: RtspClientTcpSetupOptions | RtspClientUdpSetupOptions, headers?: Headers) {
+        const protocol = options.type === 'udp' ? '' : '/TCP';
         const client = options.type === 'udp' ? 'client_port' : 'interleaved';
         let port: number;
         if (options.type === 'tcp') {
@@ -521,9 +808,9 @@ export class RtspClient extends RtspBase {
             port = options.dgram.address().port;
             options.dgram.on('message', data => options.onRtp(undefined, data));
         }
-        const headers: any = {
-            Transport: `RTP/AVP/${protocol};unicast;${client}=${port}-${port + 1}`,
-        };
+        headers = Object.assign({
+            Transport: `RTP/AVP${protocol};unicast;${client}=${port}-${port + 1}`,
+        }, headers);
         const response = await this.request('SETUP', headers, options.path);
         let interleaved: {
             begin: number;
@@ -556,14 +843,12 @@ export class RtspClient extends RtspBase {
             }
         }
         if (options.type === 'tcp')
-            this.setupOptions.set(interleaved.begin, options);
+            this.setupOptions.set(interleaved ? interleaved.begin : port, options);
         return Object.assign({ interleaved, options }, response);
     }
 
-    async play(start: string = '0.000') {
-        const headers: any = {
-            Range: `npt=${start}-`,
-        };
+    async play(headers: Headers = {}, start = '0.000') {
+        headers['Range'] = `npt=${start}-`;
         return this.request('PLAY', headers);
     }
 
@@ -572,6 +857,20 @@ export class RtspClient extends RtspBase {
             Range: `npt=${start}-`,
         };
         return this.writeRequest('PLAY', headers);
+    }
+
+    writeRtpPayload(header: Buffer, rtp: Buffer) {
+        this.client.write(header);
+        return this.client.write(Buffer.from(rtp));
+    }
+
+    send(rtp: Buffer, channel: number) {
+        const header = Buffer.alloc(4);
+        header.writeUInt8(RTSP_FRAME_MAGIC, 0);
+        header.writeUInt8(channel, 1);
+        header.writeUInt16BE(rtp.length, 2);
+
+        return this.writeRtpPayload(header, rtp);
     }
 
     async pause() {
@@ -598,6 +897,8 @@ export interface RtspTrack {
     destination: number;
     codec: string;
     control: string;
+    rtp?: dgram.Socket;
+    rtcp?: dgram.Socket;
 }
 
 export class RtspServer {
@@ -607,20 +908,24 @@ export class RtspServer {
         [trackId: string]: RtspTrack;
     } = {};
 
-    constructor(public client: Duplex, public sdp?: string, public udp?: dgram.Socket, public checkRequest?: (method: string, url: string, headers: Headers, rawMessage: string[]) => Promise<boolean>) {
+    constructor(public client: Duplex, public sdp?: string, public udp?: boolean, public checkRequest?: (method: string, url: string, headers: Headers, rawMessage: string[]) => Promise<boolean>) {
         this.session = randomBytes(4).toString('hex');
         if (sdp)
             sdp = sdp.trim();
+
+        if (client instanceof net.Socket)
+            client.setNoDelay(true);
     }
 
-    async handleSetup() {
+    async handleSetup(methods = ['play', 'record', 'teardown']) {
         let currentHeaders: string[] = [];
         while (true) {
             let line = await readLine(this.client);
             line = line.trim();
             if (!line) {
-                if (!await this.headers(currentHeaders))
-                    break;
+                const method = await this.headers(currentHeaders);
+                if (methods.includes(method))
+                    return method;
                 currentHeaders = [];
                 continue;
             }
@@ -665,19 +970,23 @@ export class RtspServer {
         }
     }
 
+    writeRtpPayload(header: Buffer, rtp: Buffer) {
+        this.client.write(header);
+        return this.client.write(Buffer.from(rtp));
+    }
+
     send(rtp: Buffer, channel: number) {
         const header = Buffer.alloc(4);
         header.writeUInt8(36, 0);
         header.writeUInt8(channel, 1);
         header.writeUInt16BE(rtp.length, 2);
 
-        this.client.write(header);
-        return this.client.write(Buffer.from(rtp));
+        return this.writeRtpPayload(header, rtp);
     }
 
-    sendUdp(port: number, packet: Buffer, rtcp: boolean) {
+    sendUdp(udp: dgram.Socket, port: number, packet: Buffer) {
         // todo: support non local host?
-        this.udp.send(packet, rtcp ? port + 1 : port, '127.0.0.1');
+        udp.send(packet, port, '127.0.0.1');
     }
 
     sendTrack(trackId: string, packet: Buffer, rtcp: boolean) {
@@ -691,17 +1000,23 @@ export class RtspServer {
             if (!this.udp)
                 this.console?.warn('RTSP Server UDP socket not available.');
             else
-                this.sendUdp(track.destination, packet, rtcp);
+                this.sendUdp(rtcp ? track.rtcp : track.rtp, track.destination, packet);
             return true;
         }
 
         return this.send(packet, rtcp ? track.destination + 1 : track.destination);
     }
 
+    availableOptions = ['DESCRIBE', 'OPTIONS', 'PAUSE', 'PLAY', 'SETUP', 'TEARDOWN', 'ANNOUNCE', 'RECORD', 'GET_PARAMETER'];
     options(url: string, requestHeaders: Headers) {
         const headers: Headers = {};
-        headers['Public'] = 'DESCRIBE, OPTIONS, PAUSE, PLAY, SETUP, TEARDOWN, ANNOUNCE, RECORD';
+        headers['Public'] = this.availableOptions.join(', ');
 
+        this.respond(200, 'OK', requestHeaders, headers);
+    }
+
+    async get_parameter(url: string, requestHeaders: Headers) {
+        const headers: Headers = {};
         this.respond(200, 'OK', requestHeaders, headers);
     }
 
@@ -721,12 +1036,14 @@ export class RtspServer {
         }
     }
 
+
+    resolveInterleaved?: (msection: MSection) => [number, number];
+
     // todo: use the sdp itself to determine the audio/video track ids so
     // rewriting is not necessary.
-    setup(url: string, requestHeaders: Headers) {
+    async setup(url: string, requestHeaders: Headers) {
         const headers: Headers = {};
-        const transport = requestHeaders['transport'];
-        headers['Transport'] = transport;
+        let transport = requestHeaders['transport'];
         headers['Session'] = this.session;
         const parsedSdp = parseSdp(this.sdp);
         const msection = parsedSdp.msections.find(msection => url.endsWith(msection.control));
@@ -735,35 +1052,52 @@ export class RtspServer {
             return;
         }
 
-        if (transport.includes('UDP')) {
+        if (transport.includes('TCP')) {
+            if (this.resolveInterleaved) {
+                const [low, high] = this.resolveInterleaved(msection);
+                this.setupInterleaved(msection, low, high);
+                transport = `RTP/AVP/TCP;unicast;interleaved=${low}-${high}`;
+            }
+            else {
+                const match = transport.match(/.*?interleaved=([0-9]+)-([0-9]+)/);
+                if (match) {
+                    const low = parseInt(match[1]);
+                    const high = parseInt(match[2]);
+                    this.setupInterleaved(msection, low, high);
+                }
+            }
+        }
+        else {
             if (!this.udp) {
                 this.respond(461, 'Unsupported Transport', requestHeaders, {});
                 return;
             }
             const match = transport.match(/.*?client_port=([0-9]+)-([0-9]+)/);
             const [_, rtp, rtcp] = match;
+
+            const [rtpServer, rtcpServer] = await createSquentialBindZero();
+            this.client.on('close', () => closeQuiet(rtpServer.server));
+            this.client.on('close', () => closeQuiet(rtcpServer.server));
             this.setupTracks[msection.control] = {
                 control: msection.control,
                 protocol: 'udp',
                 destination: parseInt(rtp),
                 codec: msection.codec,
+                rtp: rtpServer.server,
+                rtcp: rtcpServer.server,
             }
+            transport = transport.replace('RTP/AVP/UDP', 'RTP/AVP').replace('RTP/AVP', 'RTP/AVP/UDP');
+            transport += `;server_port=${rtpServer.port}-${rtcpServer.port}`;
         }
-        else if (transport.includes('TCP')) {
-            const match = transport.match(/.*?interleaved=([0-9]+)-([0-9]+)/);
-            if (match) {
-                const low = parseInt(match[1]);
-                const high = parseInt(match[2]);
-                this.setupInterleaved(msection, low, high);
-            }
-        }
+        headers['Transport'] = transport;
         this.respond(200, 'OK', requestHeaders, headers)
     }
 
     play(url: string, requestHeaders: Headers) {
         const headers: Headers = {};
         const rtpInfos = Object.values(this.setupTracks).map(track => `url=${url}/${track.control}`);
-        const rtpInfo = rtpInfos.join(',') + ';seq=0;rtptime=0';
+        // seq/rtptime was causing issues with gstreamer. commented out.
+        const rtpInfo = rtpInfos.join(','); // + ';seq=0;rtptime=0';
         headers['RTP-Info'] = rtpInfo;
         headers['Range'] = 'npt=now-';
         headers['Session'] = this.session;
@@ -815,13 +1149,13 @@ export class RtspServer {
         }
 
         const thisAny = this as any;
-        if (!thisAny[method]) {
+        if (!thisAny[method] || !this.availableOptions.includes(method.toUpperCase())) {
             this.respond(400, 'Bad Request', requestHeaders, {});
             return;
         }
 
         await thisAny[method](url, requestHeaders);
-        return method !== 'play' && method !== 'record' && method !== 'teardown';
+        return method;
     }
 
     respond(code: number, message: string, requestHeaders: Headers, headers: Headers, buffer?: Buffer) {
@@ -840,5 +1174,43 @@ export class RtspServer {
             this.client.write(buffer);
             this.console?.log('response body', buffer.toString());
         }
+    }
+
+    destroy() {
+        this.client.destroy();
+        for (const track of Object.values(this.setupTracks)) {
+            closeQuiet(track.rtp);
+            closeQuiet(track.rtcp);
+        }
+    }
+}
+
+export async function listenSingleRtspClient<T extends RtspServer>(options?: {
+    hostname: string,
+    pathToken?: string,
+    createServer?(duplex: Duplex): T,
+}) {
+    const pathToken = options?.pathToken || crypto.randomBytes(8).toString('hex');
+    let { url, clientPromise, server } = await listenZeroSingleClient(options?.hostname);
+
+    const rtspServerPath = '/' + pathToken;
+    url = url.replace('tcp:', 'rtsp:') + rtspServerPath;
+
+    const rtspServerPromise = clientPromise.then(client => {
+        const createServer = options?.createServer || (duplex => new RtspServer(duplex));
+
+        const rtspServer = createServer(client);
+        rtspServer.checkRequest = async (method, url, headers, message) => {
+            rtspServer.checkRequest = undefined;
+            const u = new URL(url);
+            return u.pathname === rtspServerPath;
+        };
+        return rtspServer as T;
+    });
+
+    return {
+        url,
+        rtspServerPromise,
+        server,
     }
 }

@@ -1,26 +1,28 @@
+import { RtpPacket } from '@koush/werift-src/packages/rtp/src/index';
 import type { RtcpRrPacket } from '@koush/werift-src/packages/rtp/src/rtcp/rr';
 import { RtcpPacketConverter } from '@koush/werift-src/packages/rtp/src/rtcp/rtcp';
-import { RtpPacket } from '@koush/werift-src/packages/rtp/src/rtp/rtp';
 import { ProtectionProfileAes128CmHmacSha1_80 } from '@koush/werift-src/packages/rtp/src/srtp/const';
 import { SrtcpSession } from '@koush/werift-src/packages/rtp/src/srtp/srtcp';
-import { bindUdp, closeQuiet } from '@scrypted/common/src/listen-cluster';
+import { SrtpSession } from '@koush/werift-src/packages/rtp/src/srtp/srtp';
+import { bindUdp, closeQuiet, listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
 import { timeoutPromise } from '@scrypted/common/src/promise-utils';
-import sdk, { Camera, FFmpegInput, Intercom, MediaStreamOptions, RequestMediaStreamOptions, ScryptedDevice, ScryptedInterface, ScryptedMimeTypes, VideoCamera, VideoCameraConfiguration } from '@scrypted/sdk';
+import { RtspServer } from '@scrypted/common/src/rtsp-server';
+import { addTrackControls, parseSdp } from '@scrypted/common/src/sdp-utils';
+import sdk, { Camera, FFmpegInput, Intercom, MediaStreamFeedback, RequestMediaStreamOptions, ScryptedDevice, ScryptedInterface, ScryptedMimeTypes, VideoCamera, VideoCameraConfiguration } from '@scrypted/sdk';
 import dgram, { SocketType } from 'dgram';
 import { once } from 'events';
 import os from 'os';
-import { AudioStreamingCodecType, CameraController, CameraStreamingDelegate, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, StartStreamRequest, StreamingRequest, StreamRequestCallback, StreamRequestTypes } from '../../hap';
+import { getScryptedServerAddress, getScryptedServerAddresses } from '../../address-override';
+import { AudioStreamingCodecType, CameraController, CameraStreamingDelegate, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, StartStreamRequest, StreamRequestCallback, StreamRequestTypes, StreamingRequest } from '../../hap';
 import type { HomeKitPlugin } from "../../main";
-import { startRtpSink } from '../../rtp/rtp-ffmpeg-input';
 import { createSnapshotHandler } from '../camera/camera-snapshot';
-import { DynamicBitrateSession } from './camera-dynamic-bitrate';
+import { getDebugMode } from './camera-debug-mode-storage';
+import { createReturnAudioSdp } from './camera-return-audio';
 import { startCameraStreamFfmpeg } from './camera-streaming-ffmpeg';
 import { CameraStreamingSession } from './camera-streaming-session';
 import { getStreamingConfiguration } from './camera-utils';
 
 const { mediaManager } = sdk;
-const v4Regex = /^[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}$/
-const v4v6Regex = /^::ffff:[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}$/;
 
 async function getPort(socketType: SocketType, address: string): Promise<{ socket: dgram.Socket, port: number }> {
     const socket = dgram.createSocket(socketType);
@@ -58,18 +60,45 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             });
 
             const socketType = request.addressVersion === 'ipv6' ? 'udp6' : 'udp4';
-            let addressOverride = homekitPlugin.storageSettings.values.addressOverride || undefined;
+            const scryptedServerAddresses = await getScryptedServerAddresses();
+            // plugin scope or device scope?
+            if (!scryptedServerAddresses?.length) {
+                console.warn('===========================================================================');
+                console.warn('Scrypted Server Addresses are not set in Scrypted settings.');
+                console.warn('If there are issues streaming, set this address to your wired IP address manually.');
+                console.warn('More information can be found in the HomeKit Plugin README.');
+                console.warn('===========================================================================');
 
-            if (addressOverride) {
+                sdk.log.a('Scrypted Server Addresses are not set in Scrypted settings. More information can be found in the HomeKit Plugin README.');
+            }
+
+            let { sourceAddress } = request;
+            if (socketType === 'udp4' && sourceAddress.startsWith('::ffff:'))
+                sourceAddress = sourceAddress.replace('::ffff:', '');
+
+            const found = scryptedServerAddresses?.find(address => address.includes(sourceAddress));
+            if (!found && scryptedServerAddresses?.length) {
+                console.warn('Connection source address was not found in the list of configured Scrypted Server Addresses. Overriding.', {
+                    sourceAddress,
+                    scryptedServerAddresses
+                });
+
+                const tryAddress = await getScryptedServerAddress(socketType);
                 const infos = Object.values(os.networkInterfaces()).flat().map(i => i?.address);
-                if (!infos.find(address => address === addressOverride)) {
-                    console.error('The provided Scrypted Server Address was not found in the list of network addresses and may be invalid and will not be used (DHCP assignment change?): ' + addressOverride);
-                    addressOverride = undefined;
+                if (!infos.find(address => address === tryAddress)) {
+                    const error = 'The provided Scrypted Server Address was not found in the list of network addresses and may be invalid and will not be used (DHCP assignment change?): ' + tryAddress;
+                    console.error(error);
+                    sdk.log.a(error);
+                }
+                else {
+                    sourceAddress = tryAddress;
                 }
             }
 
-            const { socket: videoReturn, port: videoPort } = await getPort(socketType, addressOverride);
-            const { socket: audioReturn, port: audioPort } = await getPort(socketType, addressOverride);
+            const { socket: videoReturn, port: videoPort } = await getPort(socketType, sourceAddress);
+            const { socket: audioReturn, port: audioPort } = await getPort(socketType, sourceAddress);
+            videoReturn.setSendBufferSize(1024 * 1024);
+            audioReturn.setSendBufferSize(1024 * 1024);
 
             killPromise.finally(() => {
                 closeQuiet(videoReturn);
@@ -124,49 +153,18 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                     srtp_salt: request.audio.srtp_salt,
                     port: audioPort,
                     ssrc: audiossrc,
-                }
+                },
+                addressOverride: sourceAddress,
             }
 
-            console.log('destination address', session.prepareRequest.targetAddress, session.prepareRequest.video.port, session.prepareRequest.audio.port);
-            // plugin scope or device scope?
-            if (addressOverride) {
-                console.log('using address override', addressOverride);
-                response.addressOverride = addressOverride;
-            }
-            else {
-                // HAP-NodeJS has weird default address determination behavior. Ideally it should use
-                // the same IP address as the incoming socket, because that is by definition reachable.
-                // But it seems to rechoose a matching address based on the interface. This guessing
-                // can be error prone if that interface offers multiple addresses, some of which
-                // may not be reachable.
-                // Return the incoming address, assuming the sanity checks pass. Otherwise, fall through
-                // to the HAP-NodeJS implementation.
-                let check: string;
-                if (request.addressVersion === 'ipv4') {
-                    const localAddress = request.connection.localAddress;
-                    if (v4Regex.exec(localAddress)) {
-                        check = localAddress;
-                    }
-                    else if (v4v6Regex.exec(localAddress)) {
-                        // if this is a v4 over v6 address, parse it out.
-                        check = localAddress.substring('::ffff:'.length);
-                    }
-                }
-                else if (request.addressVersion === 'ipv6' && !v4Regex.exec(request.connection.localAddress)) {
-                    check = request.connection.localAddress;
-                }
-
-                // sanity check this address.
-                if (check) {
-                    const infos = os.networkInterfaces()[request.connection.networkInterface];
-                    if (infos && infos.find(info => info.address === check)) {
-                        response.addressOverride = check;
-                    }
-                }
-            }
-
-            console.log('source address', response.addressOverride, videoPort, audioPort);
-            // console.log('prepareStream response', response);
+            console.log('addresses', {
+                sourceAddress,
+                sourceVideoPort: videoPort,
+                sourceAudioPort: audioPort,
+                targetAddress: session.prepareRequest.targetAddress,
+                targetVidioPort: session.prepareRequest.video.port,
+                targetAudioPort: session.prepareRequest.audio.port,
+            });
 
             callback(null, response);
         },
@@ -218,7 +216,6 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
 
             const {
                 destination,
-                dynamicBitrate,
                 isLowBandwidth,
                 isWatch,
             } = await getStreamingConfiguration(device, forceSlowConnection, storage, request)
@@ -241,7 +238,6 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             session.videoReturnRtcpReady = videoReturnRtcpReady;
 
             console.log({
-                dynamicBitrate,
                 isLowBandwidth,
                 isWatch,
                 destination,
@@ -280,11 +276,20 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 }
             }
 
-            const transcodingDebugMode = storage.getItem('transcodingDebugMode') === 'true';
+            const debugMode = getDebugMode(storage);
             const mediaOptions: RequestMediaStreamOptions = {
                 destination,
+                destinationId: session.prepareRequest.targetAddress,
+                destinationType: '@scrypted/homekit',
+                adaptive: true,
                 video: {
                     codec: 'h264',
+                    bitrate: request.video.max_bit_rate * 1000,
+                    // if these are sent as width/height rather than clientWidth/clientHeight,
+                    // rebroadcast will always choose substream to treat it as a hard constraint.
+                    // send as hint for adaptive bitrate.
+                    clientWidth: request.video.width,
+                    clientHeight: request.video.height,
                 },
                 audio: {
                     // opus is the preferred/default codec, and can be repacketized to fit any request if in use.
@@ -292,61 +297,51 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                     // pcm/g711 the second best option for aac-eld, since it's raw audio.
                     codec: request.audio.codec === AudioStreamingCodecType.OPUS ? 'opus' : 'pcm',
                 },
-                tool: transcodingDebugMode ? 'ffmpeg' : 'scrypted',
+                tool: debugMode.video ? 'ffmpeg' : 'scrypted',
             };
 
-            const videoInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(await device.getVideoStream(mediaOptions), ScryptedMimeTypes.FFmpegInput);
+            const mediaObject = await device.getVideoStream(mediaOptions);
+            const videoInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(mediaObject, ScryptedMimeTypes.FFmpegInput);
+            let mediaStreamFeedback: MediaStreamFeedback;
+            try {
+                // homekit mtu is unusable. webrtc uses 1200 due to weird cell networks, vpns, etc.
+                // this is the only reliable option without dynamic detection of the mtu.
+                session.startRequest.video.mtu = 1200;
+
+                mediaStreamFeedback = await sdk.mediaManager.convertMediaObject(mediaObject, ScryptedMimeTypes.MediaStreamFeedback);
+
+                // unset the MTU as it will be handled by the upstream adaptive bitrate.
+                session.startRequest.video.mtu = undefined;
+            }
+            catch (e) {
+            }
+
             session.mediaStreamOptions = videoInput.mediaStreamOptions;
-            const minBitrate = session.mediaStreamOptions?.video?.minBitrate;
-            const maxBitrate = session.mediaStreamOptions?.video?.maxBitrate;
 
-            if (dynamicBitrate && maxBitrate && minBitrate) {
-                const initialBitrate = request.video.max_bit_rate * 1000;
-                let dynamicBitrateSession = new DynamicBitrateSession(initialBitrate, minBitrate, maxBitrate, console);
+            session.tryReconfigureBitrate = (reason: string, bitrate: number) => {
+                if (!mediaStreamFeedback) {
+                    console.log('Media Stream reconfiguration was requested. Upgrade to Scrypted NVR for adaptive bitrate support.');
+                    return;
+                }
+                mediaStreamFeedback.reconfigureStream({
+                    video: {
+                        bitrate,
+                    }
+                });
+            }
 
-                session.tryReconfigureBitrate = (reason: string, bitrate: number) => {
-                    dynamicBitrateSession.onBitrateReconfigured(bitrate);
-                    const reconfigured: MediaStreamOptions = Object.assign({
-                        id: session.mediaStreamOptions?.id,
-                        video: {
-                        },
-                    }, session.mediaStreamOptions || {});
-                    reconfigured.video.bitrate = bitrate;
-
-                    console.log(`reconfigure bitrate (${reason}) ${bitrate}`);
-                    device.setVideoStreamOptions(reconfigured);
+            session.videoReturn.on('message', data => {
+                resetIdleTimeout();
+                const rtcpBuffer = vrtcp.decrypt(data);
+                if (mediaStreamFeedback) {
+                    mediaStreamFeedback.onRtcp(rtcpBuffer);
+                    return;
                 }
 
-                session.tryReconfigureBitrate('start', initialBitrate);
-
-                session.videoReturn.on('message', data => {
-                    resetIdleTimeout();
-                    const d = vrtcp.decrypt(data);
-                    const rtcp = RtcpPacketConverter.deSerialize(d);
-                    const rr = rtcp.find(packet => packet.type === 201) as RtcpRrPacket;
-                    if (!rr)
-                        return;
-                    logPacketLoss(rr);
-                    if (dynamicBitrateSession.shouldReconfigureBitrate(rr))
-                        session.tryReconfigureBitrate('rtcp', dynamicBitrateSession.currentBitrate)
-                });
-
-                // reset the video bitrate to max after a dynanic bitrate session ends.
-                session.videoReturn.on('close', async () => {
-                    session.tryReconfigureBitrate('stop', session.mediaStreamOptions?.video?.maxBitrate);
-                });
-            }
-            else {
-                session.videoReturn.on('message', data => {
-                    resetIdleTimeout();
-                    const d = vrtcp.decrypt(data);
-                    const rtcp = RtcpPacketConverter.deSerialize(d);
-                    const rr = rtcp.find(packet => packet.type === 201) as RtcpRrPacket;
-                    if (!rr)
-                        return;
-                    logPacketLoss(rr);
-                });
-            }
+                const rtcp = RtcpPacketConverter.deSerialize(rtcpBuffer);
+                const rr = rtcp.find(packet => packet.type === 201) as RtcpRrPacket;
+                logPacketLoss(rr);
+            });
 
             resetIdleTimeout();
 
@@ -354,7 +349,6 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 await startCameraStreamFfmpeg(device,
                     console,
                     storage,
-                    destination,
                     videoInput,
                     session);
             }
@@ -365,40 +359,75 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
 
             // audio talkback
             if (twoWayAudio) {
-                const socketType = session.prepareRequest.addressVersion === 'ipv6' ? 'udp6' : 'udp4';
-                const audioKey = Buffer.concat([session.prepareRequest.audio.srtp_key, session.prepareRequest.audio.srtp_salt]);
+                let rtspServer: RtspServer;
+                let track: string;
+                let twoWayAudioState: 'stopped' | 'starting' | 'started' = 'stopped';
 
-                // this is a bit hacky, as it picks random ports and spams audio at it.
-                // the resultant port is returned as an ffmpeg input to the device intercom,
-                // if it has one. which, i guess works.
-                const rtpSink = await startRtpSink(socketType, session.prepareRequest.targetAddress,
-                    audioKey, session.startRequest.audio, console);
-                session.killPromise.finally(() => rtpSink.destroy());
+                const start = async () => {
+                    try {
+                        twoWayAudioState = 'starting';
+                        const { clientPromise, url } = await listenZeroSingleClient('127.0.0.1');
+                        const rtspUrl = url.replace('tcp', 'rtsp');
+                        let sdp = createReturnAudioSdp(session.startRequest.audio);
+                        sdp = addTrackControls(sdp);
+                        const parsed = parseSdp(sdp);
+                        track = parsed.msections[0].control;
+                        const isOpus = session.startRequest.audio.codec === AudioStreamingCodecType.OPUS;
 
-                // demux the audio return socket to distinguish between rtp audio return
-                // packets and rtcp.
-                // send the audio return off to the rtp
-                let startedIntercom = false;
-                session.audioReturn.on('message', buffer => {
-                    const rtp = RtpPacket.deSerialize(buffer);
-                    if (rtp.header.payloadType === session.startRequest.audio.pt) {
-                        if (!startedIntercom) {
-                            console.log('Received first two way audio packet, starting intercom.');
-                            startedIntercom = true;
-                            mediaManager.createFFmpegMediaObject(rtpSink.ffmpegInput)
-                                .then(mo => {
-                                    device.startIntercom(mo);
-                                    session.audioReturn.once('close', () => {
-                                        console.log('Stopping intercom.');
-                                        device.stopIntercom();
-                                    });
-                                });
+                        const ffmpegInput: FFmpegInput = {
+                            url: rtspUrl,
+                            // this may not work if homekit is using aac to deliver audio, since 
+                            inputArguments: [
+                                "-acodec", isOpus ? "libopus" : "libfdk_aac",
+                                '-i', rtspUrl,
+                            ],
+                        };
+                        const mo = await mediaManager.createFFmpegMediaObject(ffmpegInput, {
+                            sourceId: device.id,
+                        });
+                        device.startIntercom(mo).catch(e => console.error('intercom failed to start', e));
+
+                        const client = await clientPromise;
+
+                        const cleanup = () => {
+                            // remove listeners to prevent a double invocation of stopIntercom.
+                            client.removeAllListeners();
+                            console.log('Stopping intercom.');
+                            device.stopIntercom();
+                            client.destroy();
+                            rtspServer = undefined;
+                            twoWayAudioState = 'stopped';
                         }
-                        session.audioReturn.send(buffer, rtpSink.rtpPort);
+                        // stop the intercom if the client dies for any reason.
+                        // allow the streaming session to continue however.
+                        client.on('close', cleanup);
+                        session.killPromise.finally(cleanup);
+
+                        rtspServer = new RtspServer(client, sdp);
+                        await rtspServer.handlePlayback();
+                        twoWayAudioState = 'started';
                     }
-                    else {
-                        rtpSink.heartbeat(session.audioReturn, buffer);
+                    catch (e) {
+                        console.error('two way audio failed', e);
+                        twoWayAudioState = 'stopped';
                     }
+                };
+
+                const srtpSession = new SrtpSession(session.aconfig);
+                session.audioReturn.on('message', buffer => {
+                    if (twoWayAudioState === 'starting')
+                        return;
+
+                    const decrypted = srtpSession.decrypt(buffer);
+                    const rtp = RtpPacket.deSerialize(decrypted);
+
+                    if (rtp.header.payloadType !== session.startRequest.audio.pt)
+                        return;
+
+                    if (twoWayAudioState !== 'started')
+                        return start();
+
+                    rtspServer.sendTrack(track, decrypted, false);
                 });
             }
         },

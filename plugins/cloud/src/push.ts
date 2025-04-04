@@ -1,5 +1,7 @@
 import { EventEmitter } from 'events';
-const { register, listen } = require('push-receiver');
+import { PushReceiver } from '@eneris/push-receiver';
+import { Deferred } from '@scrypted/common/src/deferred';
+import type { Types } from '@eneris/push-receiver/dist/client';
 
 export declare interface PushManager {
     on(event: 'message', listener: (data: any) => void): this;
@@ -8,52 +10,66 @@ export declare interface PushManager {
 
 export class PushManager extends EventEmitter {
     registrationId: Promise<string>;
+    currentRegistrationId: string;
 
-    constructor(public senders: Record<string, string>) {
+    constructor(public senderId: string) {
         super();
-        this.senders = senders;
 
         this.registrationId = (async () => {
-            const credentialsJson = localStorage.getItem('fcm');
-            let credentials: any;
+            let savedConfig: Partial<Types.ClientConfig>
             try {
-                if (!credentialsJson)
+                const savedConfigJson = localStorage.getItem('config');
+                if (!savedConfigJson)
                     throw new Error();
-                credentials = JSON.parse(credentialsJson);
+                savedConfig = JSON.parse(savedConfigJson);
             }
             catch (e) {
-                credentials = await register(Object.keys(senders)[0]);
-                localStorage.setItem('fcm', JSON.stringify(credentials));
+                savedConfig = {};
             }
 
-            let persistentIds = [];
-            try {
-                persistentIds = JSON.parse(localStorage.getItem('persistentIds'));
-            }
-            catch (e) {
-            }
-
-            const backoff = Date.now();
-            let client = await listen({ ...credentials, persistentIds: [] }, (notification: any) => {
-                try {
-                    localStorage.setItem('persistentIds', JSON.stringify(client._persistentIds));
-                    // check timestamp/type instead?
-                    if (Date.now() < backoff + 5000)
-                        return;
-                    if (!this.emit('message', notification.notification.data)) {
-                        throw new Error('unhandled message');
-                    }
-                }
-                catch (e) {
-                    console.error('error processing push message', e);
-                }
-                // console.log(notification)
+            const instance = new PushReceiver({
+                ...savedConfig,
+                firebase: {
+                    apiKey: "AIzaSyDI0bgFuVPIqKZoNpB-iTOU7ijIeepxOXE",
+                    authDomain: "scrypted-app.firebaseapp.com",
+                    databaseURL: "https://scrypted-app.firebaseio.com",
+                    projectId: "scrypted-app",
+                    storageBucket: "scrypted-app.appspot.com",
+                    messagingSenderId: "827888101440",
+                    appId: "1:827888101440:web:6ff9f8ada107e9cc0097a5"
+                },
+                heartbeatIntervalMs: 15 * 60 * 1000,
             });
 
-            const registrationId = credentials.fcm.token;
-            console.log('registration', registrationId);
-            this.emit('registrationId', registrationId);
-            return registrationId;
+            const deferred = new Deferred<string>();
+
+            const saveConfig = () => {
+                localStorage.setItem('config', JSON.stringify(savedConfig));
+            }
+
+            const stopListeningToCredentials = instance.onCredentialsChanged(({ oldCredentials, newCredentials }) => {
+                this.currentRegistrationId = newCredentials.fcm.token;
+                savedConfig.credentials = newCredentials;
+                deferred.resolve(this.currentRegistrationId);
+                this.registrationId = Promise.resolve( this.currentRegistrationId);
+                saveConfig();
+                this.emit('registrationId',  this.currentRegistrationId);
+            });
+
+            const stopListeningToNotifications = instance.onNotification(({ message }) => {
+                savedConfig.persistentIds = instance.persistentIds;
+                saveConfig();
+                this.emit('message', message.data);
+            });
+
+            try {
+                await instance.connect();
+            }
+            catch (e) {
+                console.error('failed to connect to push server', e);
+            }
+
+            return savedConfig.credentials?.fcm?.token || deferred.promise;
         })();
     }
 }

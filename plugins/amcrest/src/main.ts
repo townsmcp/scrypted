@@ -1,35 +1,34 @@
-import { listenZero } from "@scrypted/common/src/listen-cluster";
+import { automaticallyConfigureSettings, checkPluginNeedsAutoConfigure } from "@scrypted/common/src/autoconfigure-codecs";
 import { ffmpegLogInitialOutput } from '@scrypted/common/src/media-helpers';
 import { readLength } from "@scrypted/common/src/read-stream";
-import sdk, { Camera, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, PictureOptions, RequestRecordingStreamOptions, ResponseMediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, VideoCameraConfiguration, VideoRecorder } from "@scrypted/sdk";
+import sdk, { Camera, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, Lock, MediaObject, MediaStreamOptions, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, Reboot, RequestPictureOptions, RequestRecordingStreamOptions, ResponseMediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, ScryptedNativeId, Setting, VideoCameraConfiguration, VideoRecorder, VideoTextOverlay, VideoTextOverlays } from "@scrypted/sdk";
 import child_process, { ChildProcess } from 'child_process';
-import net from 'net';
-import { EventEmitter, PassThrough, Stream } from "stream";
+import { PassThrough, Readable, Stream } from "stream";
 import { OnvifIntercom } from "../../onvif/src/onvif-intercom";
-import { Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
-import { AmcrestCameraClient, AmcrestEvent, amcrestHttpsAgent } from "./amcrest-api";
+import { createRtspMediaStreamOptions, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
+import { AmcrestCameraClient, AmcrestEvent, AmcrestEventData } from "./amcrest-api";
+import { amcrestAutoConfigureSettings, autoconfigureSettings } from "./amcrest-configure";
 
 const { mediaManager } = sdk;
 
 const AMCREST_DOORBELL_TYPE = 'Amcrest Doorbell';
 const DAHUA_DOORBELL_TYPE = 'Dahua Doorbell';
 
-function findValue(blob: string, prefix: string, key: string) {
-    const lines = blob.split('\n');
-    const value = lines.find(line => line.startsWith(`${prefix}.${key}`));
-    if (!value)
-        return;
+const rtspChannelSetting: Setting = {
+    subgroup: 'Advanced',
+    key: 'rtspChannel',
+    title: 'Channel Number Override',
+    description: "The channel number to use for snapshots and video. E.g., 1, 2, etc.",
+    placeholder: '1',
+};
 
-    const parts = value.split('=');
-    return parts[1];
-}
-
-class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration, Camera, Intercom, VideoRecorder {
+class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration, Camera, Intercom, Lock, VideoRecorder, Reboot, ObjectDetector, VideoTextOverlays {
     eventStream: Stream;
     cp: ChildProcess;
     client: AmcrestCameraClient;
     videoStreamOptions: Promise<UrlMediaStreamOptions[]>;
     onvifIntercom = new OnvifIntercom(this);
+    hasSmartDetection: boolean;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -38,20 +37,100 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
             this.storage.removeItem('amcrestDoorbell');
         }
 
+        this.hasSmartDetection = this.storage.getItem('hasSmartDetection') === 'true';
+        this.updateDevice();
         this.updateDeviceInfo();
-        this.updateManagementUrl();
     }
 
-    updateManagementUrl() {
-        const ip = this.storage.getItem('ip');
-        if (!ip)
-            return;
-        const info = this.info || {};
-        const managementUrl = `http://${ip}`;
-        if (info.managementUrl !== managementUrl) {
-            info.managementUrl = managementUrl;
-            this.info = info;
+    async getVideoTextOverlays(): Promise<Record<string, VideoTextOverlay>> {
+        const client = this.getClient();
+        const response = await client.request({
+            method: "GET",
+            url: `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=getConfig&name=VideoWidget`,
+            responseType: "text",
+            headers: {
+                "Content-Type": "application/xml",
+            },
+        });
+        const body: string = response.body;
+        if (!body.startsWith("<")) {
+            const encodeBlend = '.EncodeBlend';
+            const config: Record<string, VideoTextOverlay> = {};
+
+            for (const line of body.split(/\r?\n/).filter(l => l.includes(encodeBlend + '='))) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const splitIndex = trimmed.indexOf("=");
+                if (splitIndex === -1) continue;
+                // remove encodeBlend
+                let key = trimmed.substring(0, splitIndex);
+                key = key.substring(0, key.length - encodeBlend.length);
+                config[key] = {
+                    readonly: true,
+                };
+            }
+
+            const textValue = '.Text';
+
+            for (const line of body.split(/\r?\n/).filter(l => l.includes(textValue + '='))) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const splitIndex = trimmed.indexOf("=");
+                if (splitIndex === -1) continue;
+                // remove encodeBlend
+                let key = trimmed.substring(0, splitIndex);
+                key = key.substring(0, key.length - textValue.length);
+                const text = trimmed.substring(splitIndex + 1).trim();
+                const c = config[key];
+                if (!c)
+                    continue;
+                delete c.readonly;
+                c.text = text;
+            }
+
+            return config;
+        } else {
+            throw new Error('invalid response');
+            // const json = await xml2js.parseStringPromise(body);
+            // return { json, xml: body };
         }
+    }
+
+    async setVideoTextOverlay(id: string, value: VideoTextOverlay): Promise<void> {
+        // trim the table. off id
+        if (id.startsWith('table.'))
+            id = id.substring('table.'.length);
+        const client = this.getClient();
+        if (value.text) {
+            const enableUrl = `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=setConfig&${id}.EncodeBlend=true&${id}.PreviewBlend=true`;
+            await client.request({
+                method: "GET",
+                url: enableUrl,
+                responseType: "text",
+            });
+
+            const textUrl = `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=setConfig&${id}.Text=${encodeURIComponent(
+                value.text
+            )}`;
+            await client.request({
+                method: "GET",
+                url: textUrl,
+                responseType: "text",
+            });
+        }
+        else {
+            const disableUrl = `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=setConfig&${id}.EncodeBlend=false&${id}.PreviewBlend=false`;
+            await client.request({
+                method: "GET",
+                url: disableUrl,
+                responseType: "text",
+            });
+        }
+    }
+
+    async reboot() {
+        const client = this.getClient();
+        await client.reboot();
     }
 
     getRecordingStreamCurrentTime(recordingStream: MediaObject): Promise<number> {
@@ -82,9 +161,16 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
     }
 
     async updateDeviceInfo(): Promise<void> {
-        if (this.info)
+        const ip = this.storage.getItem('ip');
+        if (!ip)
             return;
-        const deviceInfo = {};
+
+        const managementUrl = `http://${ip}`;
+        const deviceInfo: DeviceInformation = {
+            ...this.info,
+            ip,
+            managementUrl,
+        };
 
         const deviceParameters = [
             { action: "getVendor", replace: "vendor=", parameter: "manufacturer" },
@@ -95,11 +181,11 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
 
         for (const element of deviceParameters) {
             try {
-                const response = await this.getClient().digestAuth.request({
-                    url: `http://${this.getHttpAddress()}/cgi-bin/magicBox.cgi?action=${element.action}`
+                const response = await this.getClient().request({
+                    url: `http://${this.getHttpAddress()}/cgi-bin/magicBox.cgi?action=${element.action}`,
+                    responseType: 'text',
                 });
-
-                const result = String(response.data).replace(element.replace, "").trim();
+                const result = String(response.body).replace(element.replace, "").trim();
                 deviceInfo[element.parameter] = result;
             }
             catch (e) {
@@ -110,18 +196,10 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         this.info = deviceInfo;
     }
 
-    async setVideoStreamOptions(options: MediaStreamOptions): Promise<void> {
-        let bitrate = options?.video?.bitrate;
-        if (!bitrate)
-            return;
-        bitrate = Math.round(bitrate / 1000);
-        // what is Encode[0]? Is that the camera number?
+    async setVideoStreamOptions(options: MediaStreamOptions) {
         const channel = parseInt(this.getRtspChannel()) || 1;
-        const format = options.id === 'channel0' ? 'MainFormat' : 'ExtraFormat';
-        const response = await this.getClient().digestAuth.request({
-            url: `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=setConfig&Encode[${channel - 1}].${format}[0].Video.BitRate=${bitrate}`
-        });
-        this.console.log('reconfigure result', response.data);
+        const client = this.getClient();
+        return client.configureCodecs(channel, options);
     }
 
     getClient() {
@@ -130,86 +208,131 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         return this.client;
     }
 
-    listenEvents() {
-        const ret = new EventEmitter() as (EventEmitter & Destroyable);
-        ret.destroy = () => {
-        };
-        (async () => {
-            try {
-                const client = new AmcrestCameraClient(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console);
-                const events = await client.listenEvents();
-                const doorbellType = this.storage.getItem('doorbellType');
+    async listenEvents() {
+        let motionTimeout: NodeJS.Timeout;
 
-                ret.destroy = () => {
-                    events.removeAllListeners();
-                    events.destroy();
-                };
+        const motionTimeoutDuration = 20000;
+        const resetMotionTimeout = () => {
+            clearTimeout(motionTimeout);
+            motionTimeout = setTimeout(() => {
+                this.motionDetected = false;
+            }, motionTimeoutDuration);
+        }
 
-                let pulseTimeout: NodeJS.Timeout;
+        const client = new AmcrestCameraClient(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console);
+        const events = await client.listenEvents();
+        const doorbellType = this.storage.getItem('doorbellType');
+        const callerId = this.storage.getItem('callerID');
+        const multipleCallIds = this.storage.getItem('multipleCallIds') === 'true';
 
-                events.on('close', () => ret.emit('error', new Error('close')));
-                events.on('error', e => ret.emit('error', e));
-                events.on('data', (data: Buffer) => {
-                    if (this.storage.getItem('debug'))
-                        this.console.log('event', data.toString());
-                });
-                events.on('event', (event: AmcrestEvent, index: string, payload: string) => {
-                    const channelNumber = this.getRtspChannel();
-                    if (channelNumber) {
-                        const idx = parseInt(index) + 1;
-                        if (idx.toString() !== channelNumber)
-                            return;
-                    }
-                    if (event === AmcrestEvent.MotionStart) {
-                        this.motionDetected = true;
-                    }
-                    else if (event === AmcrestEvent.MotionStop) {
-                        this.motionDetected = false;
-                    }
-                    else if (event === AmcrestEvent.AudioStart) {
-                        this.audioDetected = true;
-                    }
-                    else if (event === AmcrestEvent.AudioStop) {
-                        this.audioDetected = false;
-                    }
-                    else if (event === AmcrestEvent.TalkInvite
-                        || event === AmcrestEvent.PhoneCallDetectStart
-                        || event === AmcrestEvent.AlarmIPCStart
-                        || event === AmcrestEvent.DahuaTalkInvite) {
+        let pulseTimeout: NodeJS.Timeout;
+
+        events.on('event', (event: AmcrestEvent, index: string, payload: string) => {
+            const channelNumber = this.getRtspChannel();
+            if (channelNumber) {
+                const idx = parseInt(index) + 1;
+                if (idx.toString() !== channelNumber)
+                    return;
+            }
+            if (event === AmcrestEvent.MotionStart
+                || event === AmcrestEvent.SmartMotionHuman
+                || event === AmcrestEvent.SmartMotionVehicle
+                || event === AmcrestEvent.CrossLineDetection
+                || event === AmcrestEvent.CrossRegionDetection) {
+                this.motionDetected = true;
+                resetMotionTimeout();
+            }
+            else if (event === AmcrestEvent.MotionInfo) {
+                // this seems to be a motion pulse
+                if (!this.motionDetected)
+                    this.motionDetected = true;
+                resetMotionTimeout();
+            }
+            else if (event === AmcrestEvent.MotionStop) {
+                // use resetMotionTimeout
+            }
+            else if (event === AmcrestEvent.AudioStart) {
+                this.audioDetected = true;
+            }
+            else if (event === AmcrestEvent.AudioStop) {
+                this.audioDetected = false;
+            }
+            else if (event === AmcrestEvent.TalkInvite
+                || event === AmcrestEvent.PhoneCallDetectStart
+                || event === AmcrestEvent.AlarmIPCStart
+                || event === AmcrestEvent.DahuaTalkInvite) {
+                if (event === AmcrestEvent.DahuaTalkInvite && payload && multipleCallIds) {
+                    if (payload.includes(callerId)) {
                         this.binaryState = true;
                     }
-                    else if (event === AmcrestEvent.TalkHangup
-                        || event === AmcrestEvent.PhoneCallDetectStop
-                        || event === AmcrestEvent.AlarmIPCStop
-                        || event === AmcrestEvent.DahuaTalkHangup) {
-                        this.binaryState = false;
-                    }
-                    else if (event === AmcrestEvent.TalkPulse && doorbellType === AMCREST_DOORBELL_TYPE) {
-                        if (payload.includes('Invite')) {
-                            this.binaryState = true;
-                        }
-                        else if (payload.includes('Hangup')) {
-                            this.binaryState = false;
-                        }
-                    }
-                    else if (event === AmcrestEvent.DahuaTalkPulse && doorbellType === DAHUA_DOORBELL_TYPE) {
-                        clearTimeout(pulseTimeout);
-                        pulseTimeout = setTimeout(() => this.binaryState = false, 3000);
-                        this.binaryState = true;
-                    }
-                })
+                } else {
+                    this.binaryState = true;
+                }
             }
-            catch (e) {
-                ret.emit('error', e);
+            else if (event === AmcrestEvent.TalkHangup
+                || event === AmcrestEvent.PhoneCallDetectStop
+                || event === AmcrestEvent.AlarmIPCStop
+                || event === AmcrestEvent.DahuaCallDeny
+                || event === AmcrestEvent.DahuaTalkHangup) {
+                this.binaryState = false;
             }
-        })();
-        return ret;
+            else if (event === AmcrestEvent.TalkPulse && doorbellType === AMCREST_DOORBELL_TYPE) {
+                if (payload.includes('Invite')) {
+                    this.binaryState = true;
+                }
+                else if (payload.includes('Hangup')) {
+                    this.binaryState = false;
+                }
+            }
+            else if (event === AmcrestEvent.DahuaTalkPulse && doorbellType === DAHUA_DOORBELL_TYPE) {
+                clearTimeout(pulseTimeout);
+                pulseTimeout = setTimeout(() => this.binaryState = false, 3000);
+                this.binaryState = true;
+            }
+        });
+
+        events.on('smart', (className: string, data: AmcrestEventData) => {
+            if (!this.hasSmartDetection) {
+                this.hasSmartDetection = true;
+                this.storage.setItem('hasSmartDetection', 'true');
+                this.updateDevice();
+            }
+
+            const detected: ObjectsDetected = {
+                timestamp: Date.now(),
+                detections: [
+                    {
+                        score: 1,
+                        className,
+                    }
+                ],
+            };
+
+            this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
+        });
+
+        return events;
+    }
+
+    async getDetectionInput(detectionId: string, eventId?: any): Promise<MediaObject> {
+        return;
+    }
+
+    async getObjectTypes(): Promise<ObjectDetectionTypes> {
+        return {
+            classes: [
+                'person',
+                'face',
+                'car',
+            ],
+        }
     }
 
     async getOtherSettings(): Promise<Setting[]> {
         const ret = await super.getOtherSettings();
         ret.push(
             {
+                subgroup: 'Advanced',
                 title: 'Doorbell Type',
                 choices: [
                     'Not a Doorbell',
@@ -226,8 +349,6 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         const isDoorbell = doorbellType === AMCREST_DOORBELL_TYPE || doorbellType === DAHUA_DOORBELL_TYPE;
 
         let twoWayAudio = this.storage.getItem('twoWayAudio');
-        if (twoWayAudio === 'true')
-            twoWayAudio = 'Amcrest';
 
         const choices = [
             'Amcrest',
@@ -237,41 +358,94 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         if (!isDoorbell)
             choices.unshift('None');
 
+        twoWayAudio = choices.find(c => c === twoWayAudio);
+
+        if (!twoWayAudio)
+            twoWayAudio = isDoorbell ? 'Amcrest' : 'None';
+
+
+        if (doorbellType == DAHUA_DOORBELL_TYPE) {
+            ret.push(
+                {
+                    title: 'Enable Dahua Lock',
+                    key: 'enableDahuaLock',
+                    description: 'Some Dahua Doorbells have a built in lock/door access control.',
+                    type: 'boolean',
+                    value: (this.storage.getItem('enableDahuaLock') === 'true').toString(),
+                }
+            );
+
+            ret.push(
+                {
+                    title: 'Multiple Call Buttons',
+                    key: 'multipleCallIds',
+                    description: 'Some Dahua Doorbells integrate multiple Call Buttons for apartment buildings.',
+                    type: 'boolean',
+                    value: (this.storage.getItem('multipleCallIds') === 'true').toString(),
+                }
+            );
+        }
+
+        const multipleCallIds = this.storage.getItem('multipleCallIds');
+
+        if (multipleCallIds) {
+            ret.push(
+                {
+                    title: 'Caller ID',
+                    key: 'callerID',
+                    description: 'Caller ID',
+                    type: 'number',
+                    value: this.storage.getItem('callerID'),
+                }
+            )
+        }
+
+
         ret.push(
             {
+                subgroup: 'Advanced',
                 title: 'Two Way Audio',
                 value: twoWayAudio,
                 key: 'twoWayAudio',
                 description: 'Amcrest cameras may support both Amcrest and ONVIF two way audio protocols. ONVIF generally performs better when supported.',
                 choices,
             },
-            {
-                title: 'Continuous Recording',
-                key: 'continuousRecording',
-                description: 'Continuously record onto the Camera SD Card.',
-                type: 'boolean',
-                value: (this.storage.getItem('continuousRecording') === 'true').toString(),
-            },
+            // sdcard write causes jitter.
+            // {
+            //     title: 'Continuous Recording',
+            //     key: 'continuousRecording',
+            //     description: 'Continuously record onto the Camera SD Card.',
+            //     type: 'boolean',
+            //     value: (this.storage.getItem('continuousRecording') === 'true').toString(),
+            // },
         );
+
+        const ac = {
+            ...automaticallyConfigureSettings,
+            subgroup: 'Advanced',
+        };
+        ac.type = 'button';
+        ret.push(ac);
+        ret.push({
+            ...amcrestAutoConfigureSettings,
+            subgroup: 'Advanced',
+        });
 
         return ret;
     }
 
-    async takeSmartCameraPicture(option?: PictureOptions): Promise<MediaObject> {
-        return this.createMediaObject(await this.getClient().jpegSnapshot(), 'image/jpeg');
+    async takeSmartCameraPicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        return this.createMediaObject(await this.getClient().jpegSnapshot(options?.timeout), 'image/jpeg');
     }
 
     async getUrlSettings() {
+        const rtspChannel = {
+            ...rtspChannelSetting,
+            value: this.storage.getItem('rtspChannel'),
+        };
         return [
+            rtspChannel,
             ...await super.getUrlSettings(),
-            {
-                key: 'rtspChannel',
-                title: 'Channel Number Override',
-                group: 'Advanced',
-                description: "The channel number to use for snapshots and video. E.g., 1, 2, etc.",
-                placeholder: '1',
-                value: this.storage.getItem('rtspChannel'),
-            },
         ]
     }
 
@@ -279,9 +453,8 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         return this.storage.getItem('rtspChannel');
     }
 
-
     createRtspMediaStreamOptions(url: string, index: number) {
-        const ret = super.createRtspMediaStreamOptions(url, index);
+        const ret = createRtspMediaStreamOptions(url, index);
         ret.tool = 'scrypted';
         return ret;
     }
@@ -289,106 +462,89 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
     async getConstructedVideoStreamOptions(): Promise<UrlMediaStreamOptions[]> {
         const client = this.getClient();
 
-        if (!this.videoStreamOptions) {
-            this.videoStreamOptions = (async () => {
-                let mas: string;
+        if (this.videoStreamOptions)
+            return this.videoStreamOptions;
+
+        this.videoStreamOptions = (async () => {
+            const cameraNumber = parseInt(this.getRtspChannel()) || 1;
+            try {
+                let vsos: UrlMediaStreamOptions[];
                 try {
-                    const response = await client.digestAuth.request({
-                        url: `http://${this.getHttpAddress()}/cgi-bin/magicBox.cgi?action=getProductDefinition&name=MaxExtraStream`,
-                        responseType: 'text',
-                        httpsAgent: amcrestHttpsAgent,
-                    })
-                    mas = response.data.split('=')[1].trim();
-                    this.storage.setItem('maxExtraStreams', mas.toString());
-                }
-                catch (e) {
-                    this.console.error('error retrieving max extra streams', e);
-                    mas = this.storage.getItem('maxExtraStreams');
-                }
-
-                const maxExtraStreams = parseInt(mas) || 1;
-                const channel = parseInt(this.getRtspChannel()) || 1;
-                const vsos = [...Array(maxExtraStreams + 1).keys()].map(subtype => this.createRtspMediaStreamOptions(`rtsp://${this.getRtspAddress()}/cam/realmonitor?channel=${channel}&subtype=${subtype}`, subtype));
-
-                try {
-                    const capResponse = await client.digestAuth.request({
-                        url: `http://${this.getHttpAddress()}/cgi-bin/encode.cgi?action=getConfigCaps&channel=0`,
-                        responseType: 'text',
-                        httpsAgent: amcrestHttpsAgent,
-                    });
-                    this.console.log(capResponse.data);
-                    const encodeResponse = await client.digestAuth.request({
-                        url: `http://${this.getHttpAddress()}/cgi-bin/configManager.cgi?action=getConfig&name=Encode`,
-                        responseType: 'text',
-                        httpsAgent: amcrestHttpsAgent,
-                    });
-                    this.console.log(encodeResponse.data);
-
-                    for (let i = 0; i < vsos.length; i++) {
-                        const vso = vsos[i];
-                        let capName: string;
-                        let encName: string;
-                        if (i === 0) {
-                            capName = `caps[${channel - 1}].MainFormat[0]`;
-                            encName = `table.Encode[${channel - 1}].MainFormat[0]`;
-                        }
-                        else {
-                            capName = `caps[${channel - 1}].ExtraFormat[${i - 1}]`;
-                            encName = `table.Encode[${channel - 1}].ExtraFormat[${i - 1}]`;
-                        }
-
-                        const videoCodec = findValue(encodeResponse.data, encName, 'Video.Compression')
-                            ?.replace('.', '')?.toLowerCase()?.trim();
-                        let audioCodec = findValue(encodeResponse.data, encName, 'Audio.Compression')
-                            ?.replace('.', '')?.toLowerCase()?.trim();
-                        if (audioCodec?.includes('aac'))
-                            audioCodec = 'aac';
-                        else if (audioCodec.includes('g711a'))
-                            audioCodec = 'pcm_alaw';
-                        else if (audioCodec.includes('g711u'))
-                            audioCodec = 'pcm_ulaw';
-                        else if (audioCodec.includes('g711'))
-                            audioCodec = 'pcm';
-
-                        if (vso.audio)
-                            vso.audio.codec = audioCodec;
-                        vso.video.codec = videoCodec;
-
-                        const width = findValue(encodeResponse.data, encName, 'Video.Width');
-                        const height = findValue(encodeResponse.data, encName, 'Video.Height');
-                        if (width && height) {
-                            vso.video.width = parseInt(width);
-                            vso.video.height = parseInt(height);
-                        }
-
-                        const bitrateOptions = findValue(capResponse.data, capName, 'Video.BitRateOptions');
-                        if (!bitrateOptions)
-                            continue;
-
-                        const encodeOptions = findValue(encodeResponse.data, encName, 'Video.BitRate');
-                        if (!encodeOptions)
-                            continue;
-
-                        const [min, max] = bitrateOptions.split(',');
-                        if (!min || !max)
-                            continue;
-                        vso.video.bitrate = parseInt(encodeOptions) * 1000;
-                        vso.video.maxBitrate = parseInt(max) * 1000;
-                        vso.video.minBitrate = parseInt(min) * 1000;
-                    }
+                    vsos = await client.getCodecs(cameraNumber);
+                    this.storage.setItem('vsosJSON', JSON.stringify(vsos));
                 }
                 catch (e) {
                     this.console.error('error retrieving stream configurations', e);
+                    vsos = JSON.parse(this.storage.getItem('vsosJSON')) as UrlMediaStreamOptions[];
                 }
 
+                for (const [index, vso] of vsos.entries()) {
+                    vso.tool = 'scrypted';
+                    vso.url = `rtsp://${this.getRtspAddress()}/cam/realmonitor?channel=${cameraNumber}&subtype=${index}`;
+                }
                 return vsos;
-            })();
-        }
+            }
+            catch (e) {
+                this.videoStreamOptions = undefined;
+                const vsos = [...Array(2).keys()].map(subtype => {
+                    const ret = createRtspMediaStreamOptions(`rtsp://${this.getRtspAddress()}/cam/realmonitor?channel=${cameraNumber}&subtype=${subtype}`, subtype);
+                    ret.tool = 'scrypted';
+                    return ret;
+                });
+                return vsos;
+            }
+        })();
 
         return this.videoStreamOptions;
     }
 
+    updateDevice() {
+        const doorbellType = this.storage.getItem('doorbellType');
+        const isDoorbell = doorbellType === AMCREST_DOORBELL_TYPE || doorbellType === DAHUA_DOORBELL_TYPE;
+        // true is the legacy value before onvif was added.
+        const twoWayAudio = this.storage.getItem('twoWayAudio') === 'true'
+            || this.storage.getItem('twoWayAudio') === 'ONVIF'
+            || this.storage.getItem('twoWayAudio') === 'Amcrest';
+
+        const interfaces = this.provider.getInterfaces();
+        let type: ScryptedDeviceType = undefined;
+        if (isDoorbell) {
+            type = ScryptedDeviceType.Doorbell;
+            interfaces.push(ScryptedInterface.BinarySensor)
+        }
+        if (isDoorbell || twoWayAudio) {
+            interfaces.push(ScryptedInterface.Intercom);
+        }
+
+        const enableDahuaLock = this.storage.getItem('enableDahuaLock') === 'true';
+        if (isDoorbell && doorbellType === DAHUA_DOORBELL_TYPE && enableDahuaLock) {
+            interfaces.push(ScryptedInterface.Lock);
+        }
+
+        const continuousRecording = this.storage.getItem('continuousRecording') === 'true';
+        if (continuousRecording)
+            interfaces.push(ScryptedInterface.VideoRecorder);
+
+        if (this.hasSmartDetection)
+            interfaces.push(ScryptedInterface.ObjectDetector);
+
+        this.provider.updateDevice(this.nativeId, this.name, interfaces, type);
+    }
+
     async putSetting(key: string, value: string) {
+        if (key === automaticallyConfigureSettings.key) {
+            const client = this.getClient();
+            autoconfigureSettings(client, parseInt(this.getRtspChannel()) || 1)
+                .then(() => {
+                    this.log.a('Successfully configured settings.');
+                })
+                .catch(e => {
+                    this.log.a('There was an error automatically configuring settings. More information can be viewed in the console.');
+                    this.console.error('error autoconfiguring', e);
+                });
+            return;
+        }
+
         if (key === 'continuousRecording') {
             if (value === 'true') {
                 try {
@@ -409,28 +565,9 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         this.videoStreamOptions = undefined;
 
         super.putSetting(key, value);
-        const doorbellType = this.storage.getItem('doorbellType');
-        const isDoorbell = doorbellType === AMCREST_DOORBELL_TYPE || doorbellType === DAHUA_DOORBELL_TYPE;
-        // true is the legacy value before onvif was added.
-        const twoWayAudio = this.storage.getItem('twoWayAudio') === 'true'
-            || this.storage.getItem('twoWayAudio') === 'ONVIF'
-            || this.storage.getItem('twoWayAudio') === 'Amcrest';
 
-        const interfaces = provider.getInterfaces();
-        let type: ScryptedDeviceType = undefined;
-        if (isDoorbell) {
-            type = ScryptedDeviceType.Doorbell;
-            interfaces.push(ScryptedInterface.BinarySensor)
-        }
-        if (isDoorbell || twoWayAudio) {
-            interfaces.push(ScryptedInterface.Intercom);
-        }
-        const continuousRecording = this.storage.getItem('continuousRecording') === 'true';
-        if (continuousRecording)
-            interfaces.push(ScryptedInterface.VideoRecorder);
-        provider.updateDevice(this.nativeId, this.name, interfaces, type);
-
-        this.updateManagementUrl();
+        this.updateDevice();
+        this.updateDeviceInfo();
     }
 
     async startIntercom(media: MediaObject): Promise<void> {
@@ -445,9 +582,11 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
             return this.onvifIntercom.startIntercom(media);
         }
 
+        const doorbellType = this.storage.getItem('doorbellType');
+
         // not sure if this all works, since i don't actually have a doorbell.
         // good luck!
-        const channel = this.getRtspChannel() || '1';
+        const channel = parseInt(this.getRtspChannel()) || 1;
 
         const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
         const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
@@ -455,25 +594,70 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         const args = ffmpegInput.inputArguments.slice();
         args.unshift('-hide_banner');
 
-        const server = new net.Server(async (socket) => {
-            server.close();
+        let contentType: string;
 
+        if (doorbellType == DAHUA_DOORBELL_TYPE) {
+            args.push(
+                "-vn",
+                '-acodec', 'pcm_alaw',
+                '-ac', '1',
+                '-ar', '8000',
+                '-sample_fmt', 's16',
+                '-f', 'alaw',
+                'pipe:3',
+            );
+            contentType = 'Audio/G.711A';
+        }
+        else {
+            args.push(
+                "-vn",
+                '-acodec', 'aac',
+                '-f', 'adts',
+                'pipe:3',
+            );
+            contentType = 'Audio/AAC';
+            // args.push(
+            //     "-vn",
+            //     '-acodec', 'pcm_mulaw',
+            //     '-ac', '1',
+            //     '-ar', '8000',
+            //     '-sample_fmt', 's16',
+            //     '-f', 'mulaw',
+            //     'pipe:3',
+            // );
+            // contentType = 'Audio/G.711A';
+        }
+
+        this.console.log('ffmpeg intercom', args);
+
+        const ffmpeg = await mediaManager.getFFmpegPath();
+        this.cp = child_process.spawn(ffmpeg, args, {
+            stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+        });
+        this.cp.on('exit', () => this.cp = undefined);
+        ffmpegLogInitialOutput(this.console, this.cp);
+        const socket = this.cp.stdio[3] as Readable;
+
+        (async () => {
             const url = `http://${this.getHttpAddress()}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=${channel}`;
             this.console.log('posting audio data to', url);
 
             // seems the dahua doorbells preferred 1024 chunks. should investigate adts
             // parsing and sending multipart chunks instead.
             const passthrough = new PassThrough();
-            this.getClient().digestAuth.request({
-                method: 'POST',
+            const abortController = new AbortController();
+            this.getClient().request({
                 url,
+                method: 'POST',
                 headers: {
-                    'Content-Type': 'Audio/AAC',
-                    'Content-Length': '9999999'
+                    'Content-Type': contentType,
+                    'Content-Length': '9999999',
                 },
-                httpsAgent: amcrestHttpsAgent,
-                data: passthrough,
-            });
+                signal: abortController.signal,
+                responseType: 'readable',
+            }, passthrough)
+                .catch(() => { })
+                .finally(() => this.console.log('request finished'))
 
             try {
                 while (true) {
@@ -485,26 +669,12 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
             }
             finally {
                 this.console.log('audio finished');
-                passthrough.end();
+                passthrough.destroy();
+                abortController.abort();
             }
 
             this.stopIntercom();
-        });
-        const port = await listenZero(server)
-
-        args.push(
-            "-vn",
-            '-acodec', 'aac',
-            '-f', 'adts',
-            `tcp://127.0.0.1:${port}`,
-        );
-
-        this.console.log('ffmpeg intercom', args);
-
-        const ffmpeg = await mediaManager.getFFmpegPath();
-        this.cp = child_process.spawn(ffmpeg, args);
-        this.cp.on('exit', () => this.cp = undefined);
-        ffmpegLogInitialOutput(this.console, this.cp);
+        })();
     }
 
     async stopIntercom(): Promise<void> {
@@ -519,23 +689,137 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
     showRtspUrlOverride() {
         return false;
     }
+
+    async lock(): Promise<void> {
+        if (!this.client.lock()) {
+            this.console.error("Could not lock");
+        }
+    }
+
+    async unlock(): Promise<void> {
+        if (!this.client.unlock()) {
+            this.console.error("Could not unlock");
+        }
+    }
 }
 
 class AmcrestProvider extends RtspProvider {
+    constructor(nativeId?: ScryptedNativeId) {
+        super(nativeId);
+        checkPluginNeedsAutoConfigure(this);
+    }
+
     getAdditionalInterfaces() {
         return [
+            ScryptedInterface.Reboot,
             ScryptedInterface.VideoCameraConfiguration,
             ScryptedInterface.Camera,
             ScryptedInterface.AudioSensor,
             ScryptedInterface.MotionSensor,
+            ScryptedInterface.VideoTextOverlays,
         ];
+    }
+
+    getScryptedDeviceCreator(): string {
+        return 'Amcrest Camera';
+    }
+
+    async createDevice(settings: DeviceCreatorSettings, nativeId?: string): Promise<string> {
+        const httpAddress = `${settings.ip}:${settings.httpPort || 80}`;
+        let info: DeviceInformation = {};
+
+        const username = settings.username?.toString();
+        const password = settings.password?.toString();
+        const skipValidate = settings.skipValidate?.toString() === 'true';
+        let twoWayAudio: string;
+
+        const api = new AmcrestCameraClient(httpAddress, username, password, this.console);
+        if (settings.autoconfigure) {
+            const cameraNumber = parseInt(settings.rtspChannel as string) || 1;
+            await autoconfigureSettings(api, cameraNumber);
+        }
+
+        if (!skipValidate) {
+            try {
+                const deviceInfo = await api.getDeviceInfo();
+
+                settings.newCamera = deviceInfo.deviceType;
+                info.model = deviceInfo.deviceType;
+                info.serialNumber = deviceInfo.serialNumber;
+            }
+            catch (e) {
+                this.console.error('Error adding Amcrest camera', e);
+                throw e;
+            }
+
+            try {
+                if (await api.checkTwoWayAudio()) {
+                    // onvif seems to work better than Amcrest, except for AD110.
+                    twoWayAudio = 'ONVIF';
+                }
+            }
+            catch (e) {
+                this.console.warn('Error probing two way audio', e);
+            }
+        }
+        settings.newCamera ||= 'Amcrest Camera';
+
+        nativeId = await super.createDevice(settings, nativeId);
+
+        const device = await this.getDevice(nativeId) as AmcrestCamera;
+        device.info = info;
+        device.putSetting('username', username);
+        device.putSetting('password', password);
+        if (settings.rtspChannel)
+            device.putSetting('rtspChannel', settings.rtspChannel as string);
+        device.setHttpPortOverride(settings.httpPort?.toString());
+        device.setIPAddress(settings.ip?.toString());
+        if (twoWayAudio)
+            device.putSetting('twoWayAudio', twoWayAudio);
+        device.updateDeviceInfo();
+        return nativeId;
+    }
+
+    async getCreateDeviceSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'username',
+                title: 'Username',
+            },
+            {
+                key: 'password',
+                title: 'Password',
+                type: 'password',
+            },
+            {
+                key: 'ip',
+                title: 'IP Address',
+                placeholder: '192.168.2.222',
+            },
+            rtspChannelSetting,
+            {
+                subgroup: 'Advanced',
+                key: 'httpPort',
+                title: 'HTTP Port',
+                description: 'Optional: Override the HTTP Port from the default value of 80.',
+                placeholder: '80',
+            },
+            automaticallyConfigureSettings,
+            amcrestAutoConfigureSettings,
+            {
+                subgroup: 'Advanced',
+                key: 'skipValidate',
+                title: 'Skip Validation',
+                description: 'Add the device without verifying the credentials and network settings.',
+                type: 'boolean',
+            }
+        ]
     }
 
     createCamera(nativeId: string) {
         return new AmcrestCamera(nativeId, this);
     }
+
 }
 
-const provider = new AmcrestProvider();
-
-export default provider;
+export default AmcrestProvider;

@@ -14,7 +14,7 @@ const Client = require('castv2-client').Client;
 function ScryptedMediaReceiver() {
   DefaultMediaReceiver.apply(this, arguments);
 }
-ScryptedMediaReceiver.APP_ID = '00F7C5DD';
+ScryptedMediaReceiver.APP_ID = '9D66005A';
 util.inherits(ScryptedMediaReceiver, DefaultMediaReceiver);
 
 class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, EngineIOHandler, RTCSignalingClient {
@@ -88,7 +88,10 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
         }
 
         client.removeAllListeners();
-        client.close();
+        try {
+          client.close();
+        } catch (e) {
+        }
       }
       client.client.on('close', cleanup);
       client.on('error', err => {
@@ -149,6 +152,14 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
   }
 
   async load(media: string | MediaObject, options: MediaPlayerOptions) {
+    if (this.mediaPlayerPromise) {
+      try {
+        (await this.mediaPlayerPromise).close();
+      } catch (e) {
+      }
+      this.mediaPlayerPromise = undefined;
+      this.mediaPlayerStatus = undefined;
+    }
     let url: string;
     let urlMimeType: string;
 
@@ -172,7 +183,7 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
         media = await mediaManager.createMediaObjectFromUrl(media);
       }
     }
-    else if (options?.mimeType?.startsWith('image/')) {
+    else if (options?.mimeType?.startsWith('image/') || options?.mimeType?.startsWith('audio/')) {
       url = await mediaManager.convertMediaObjectToInsecureLocalUrl(media, options?.mimeType);
     }
 
@@ -201,7 +212,15 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
 
     const engineio = await endpointManager.getPublicLocalEndpoint(this.nativeId) + 'engine.io/';
     const mo = await mediaManager.createMediaObject(Buffer.from(engineio), ScryptedMimeTypes.LocalUrl);
-    const cameraStreamAuthToken = await mediaManager.convertMediaObjectToUrl(mo, ScryptedMimeTypes.LocalUrl);
+    let cameraStreamAuthToken: string;
+
+    try {
+      cameraStreamAuthToken = await mediaManager.convertMediaObjectToUrl(mo, ScryptedMimeTypes.LocalUrl);
+    }
+    catch (e) {
+      this.log.a('Streaming failed. Install and set up Scrypted Cloud to cast this media type.');
+      throw e;
+    }
 
     const castMedia: any = {
       contentId: cameraStreamAuthToken,
@@ -240,9 +259,7 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
     reject: any;
   };
 
-  async onConnection(request: HttpRequest, webSocketUrl: string) {
-    const ws = new WebSocket(webSocketUrl);
-
+  async onConnection(request: HttpRequest, ws: WebSocket) {
     ws.onmessage = async (message) => {
       const json = JSON.parse(message.data as string);
       const { token } = json;
@@ -335,15 +352,7 @@ class CastDevice extends ScryptedDeviceBase implements MediaPlayer, Refresh, Eng
                 });
               })
 
-              player.getStatus((err, status) => {
-                if (err) {
-                  reject(err);
-                  return;
-                }
-                this.mediaPlayerStatus = status;
-                this.updateState();
-                resolve(player);
-              })
+              resolve(player);
             });
           });
         });
@@ -460,6 +469,12 @@ class CastDeviceProvider extends ScryptedDeviceBase implements DeviceProvider {
   constructor() {
     super(null);
 
+    endpointManager.setAccessControlAllowOrigin({
+      origins: [
+        // chromecast receiver
+        'https://koush.github.io',
+      ],
+    });
 
     this.browser.on('response', response => {
       for (const additional of response.additionals) {
@@ -517,14 +532,12 @@ class CastDeviceProvider extends ScryptedDeviceBase implements DeviceProvider {
       ScryptedInterface.StartStop,
       ScryptedInterface.Pause,
       ScryptedInterface.EngineIOHandler,
+      ScryptedInterface.RTCSignalingClient,
     ];
 
     const type = (model && model.indexOf('Google Home') !== -1 && model.indexOf('Hub') == -1)
       ? ScryptedDeviceType.Speaker
       : ScryptedDeviceType.Display;
-
-    if (type === ScryptedDeviceType.Display)
-      interfaces.push(ScryptedInterface.RTCSignalingClient)
 
     const device: Device = {
       nativeId: id,
@@ -541,17 +554,21 @@ class CastDeviceProvider extends ScryptedDeviceBase implements DeviceProvider {
     this.search.emit(id);
     await deviceManager.onDeviceDiscovered(device);
 
-    const castDevice = this.getDevice(id);
+    const castDevice = await this.getDevice(id);
     castDevice.storage.setItem('host', ip);
   }
 
-  getDevice(nativeId: string) {
+  async getDevice(nativeId: string) {
     let ret = this.devices.get(nativeId);
     if (!ret) {
       ret = new CastDevice(this, nativeId);
       this.devices.set(nativeId, ret);
     }
     return ret;
+  }
+
+  async releaseDevice(id: string, nativeId: string): Promise<void> {
+
   }
 
   async discoverDevices(duration: number) {

@@ -1,53 +1,20 @@
-import sdk, { ScryptedDeviceBase, DeviceProvider, Settings, Setting, ScryptedDeviceType, VideoCamera, MediaObject, MediaStreamOptions, ScryptedInterface, FFmpegInput, Camera, PictureOptions, SettingValue, DeviceCreator, DeviceCreatorSettings, ResponseMediaStreamOptions } from "@scrypted/sdk";
-import AxiosDigestAuth from '@koush/axios-digest-auth';
-import https from 'https';
+import sdk, { Camera, DeviceCreator, DeviceCreatorSettings, DeviceProvider, MediaObject, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedNativeId, Setting, Settings, SettingValue, VideoCamera } from "@scrypted/sdk";
 import { randomBytes } from "crypto";
 
-const { deviceManager, mediaManager } = sdk;
-
-const httpsAgent = new https.Agent({
-    rejectUnauthorized: false
-});
+const { deviceManager } = sdk;
 
 export interface UrlMediaStreamOptions extends ResponseMediaStreamOptions {
     url: string;
 }
 
 export abstract class CameraBase<T extends ResponseMediaStreamOptions> extends ScryptedDeviceBase implements Camera, VideoCamera, Settings {
-    snapshotAuth: AxiosDigestAuth;
-    pendingPicture: Promise<MediaObject>;
-
     constructor(nativeId: string, public provider: CameraProviderBase<T>) {
         super(nativeId);
     }
 
-    protected async takePictureUrl(snapshotUrl: string) {
-        if (!this.snapshotAuth) {
-            this.snapshotAuth = new AxiosDigestAuth({
-                username: this.getUsername(),
-                password: this.getPassword(),
-            });
-        }
-        const response = await this.snapshotAuth.request({
-            httpsAgent,
-            method: "GET",
-            responseType: 'arraybuffer',
-            url: snapshotUrl,
-        });
-
-        return mediaManager.createMediaObject(Buffer.from(response.data), response.headers['Content-Type'] || 'image/jpeg');
+    takePicture(option?: PictureOptions): Promise<MediaObject> {
+        throw new Error("The RTSP Camera does not provide snapshots. Install the Snapshot Plugin if snapshots are available via an URL.");
     }
-
-    async takePicture(option?: PictureOptions): Promise<MediaObject> {
-        if (!this.pendingPicture) {
-            this.pendingPicture = this.takePictureThrottled(option);
-            this.pendingPicture.finally(() => this.pendingPicture = undefined);
-        }
-
-        return this.pendingPicture;
-    }
-
-    abstract takePictureThrottled(option?: PictureOptions): Promise<MediaObject>;
 
     async getPictureOptions(): Promise<PictureOptions[]> {
         return;
@@ -59,10 +26,6 @@ export abstract class CameraBase<T extends ResponseMediaStreamOptions> extends S
     }
 
     abstract getRawVideoStreamOptions(): T[];
-
-    isAudioDisabled() {
-        return this.storage.getItem('noAudio') === 'true';
-    }
 
     async getVideoStream(options?: T): Promise<MediaObject> {
         const vsos = await this.getVideoStreamOptions();
@@ -106,7 +69,7 @@ export abstract class CameraBase<T extends ResponseMediaStreamOptions> extends S
     }
 
     async getSettings(): Promise<Setting[]> {
-        return [
+        const ret: Setting[] = [
             {
                 key: 'username',
                 title: 'Username',
@@ -123,27 +86,25 @@ export abstract class CameraBase<T extends ResponseMediaStreamOptions> extends S
             ...await this.getUrlSettings(),
             ...await this.getStreamSettings(),
             ...await this.getOtherSettings(),
-            {
-                key: 'noAudio',
-                title: 'No Audio',
-                description: 'Enable this setting if the camera does not have audio or to mute audio.',
-                type: 'boolean',
-                value: (this.isAudioDisabled()).toString(),
-            },
         ];
+
+        for (const s of ret) {
+            s.group = this.provider.name.replace('Plugin', '').trim();
+            s.subgroup ||= 'General';
+        }
+
+        return ret;
     }
 
     async putSettingBase(key: string, value: SettingValue) {
         if (key === 'defaultStream') {
             const vsos = await this.getVideoStreamOptions();
             const stream = vsos.find(vso => vso.name === value);
-            this.storage.setItem('defaultStream', stream?.id);
+            this.storage.setItem('defaultStream', stream?.id || '');
         }
         else {
             this.storage.setItem(key, value.toString());
         }
-
-        this.snapshotAuth = undefined;
 
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
@@ -159,15 +120,14 @@ export abstract class CameraProviderBase<T extends ResponseMediaStreamOptions> e
     constructor(nativeId?: string) {
         super(nativeId);
 
-        for (const camId of deviceManager.getNativeIds()) {
-            if (camId)
-                this.getDevice(camId);
-        }
+        this.systemDevice = {
+            deviceCreator: this.getScryptedDeviceCreator(),
+        };
     }
 
-    async createDevice(settings: DeviceCreatorSettings): Promise<string> {
-        const nativeId = randomBytes(4).toString('hex');
-        const name = settings.newCamera.toString();
+    async createDevice(settings: DeviceCreatorSettings, nativeId?: ScryptedNativeId): Promise<string> {
+        nativeId ||= randomBytes(4).toString('hex');
+        const name = settings.newCamera?.toString() || 'New Camera';
         await this.updateDevice(nativeId, name, this.getInterfaces());
         return nativeId;
     }
@@ -188,8 +148,11 @@ export abstract class CameraProviderBase<T extends ResponseMediaStreamOptions> e
     }
 
     getInterfaces() {
-        return [ScryptedInterface.VideoCamera,
-        ScryptedInterface.Settings, ...this.getAdditionalInterfaces()];
+        return [
+            ScryptedInterface.VideoCamera,
+            ScryptedInterface.Settings,
+            ...this.getAdditionalInterfaces()
+        ];
     }
 
     updateDevice(nativeId: string, name: string, interfaces: string[], type?: ScryptedDeviceType) {
@@ -198,10 +161,12 @@ export abstract class CameraProviderBase<T extends ResponseMediaStreamOptions> e
             name,
             interfaces,
             type: type || ScryptedDeviceType.Camera,
+            info: deviceManager.getNativeIds().includes(nativeId) ? deviceManager.getDeviceState(nativeId)?.info : undefined,
         });
     }
 
     abstract createCamera(nativeId: string): CameraBase<T>;
+    abstract getScryptedDeviceCreator(): string;
 
     getDevice(nativeId: string) {
         let ret = this.devices.get(nativeId);
@@ -211,5 +176,9 @@ export abstract class CameraProviderBase<T extends ResponseMediaStreamOptions> e
                 this.devices.set(nativeId, ret);
         }
         return ret;
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        this.devices.delete(nativeId);
     }
 }

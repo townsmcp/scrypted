@@ -19,7 +19,7 @@ function isPi(model: string) {
 export function isRaspberryPi() {
     let cpuInfo: string;
     try {
-        cpuInfo = require('realfs').readFileSync('/proc/cpuinfo', { encoding: 'utf8' });
+        cpuInfo = require('fs').readFileSync('/proc/cpuinfo', { encoding: 'utf8' });
     }
     catch (e) {
         // if this fails, this is probably not a pi
@@ -70,11 +70,7 @@ export function getH264DecoderArgs(): CodecArgs {
         ],
     };
 
-    if (isRaspberryPi()) {
-        ret['Raspberry Pi'] = ['-c:v', 'h264_mmal'];
-        ret[V4L2] = ['-c:v', 'h264_v4l2m2m'];
-    }
-    else if (os.platform() === 'linux') {
+    if (os.platform() === 'linux') {
         ret[V4L2] = ['-c:v', 'h264_v4l2m2m'];
     }
     else if (os.platform() === 'win32') {
@@ -137,8 +133,14 @@ export function getH264EncoderArgs() {
 export function getDebugModeH264EncoderArgs() {
     return [
         "-c:v", "libx264",
+        // consider using yuv420 as that is simpler?
+        // https://trac.ffmpeg.org/wiki/Encode/H.264
         '-pix_fmt', 'yuvj420p',
+        // this seems to force constrained baseline? even if the
+        // profile is explicitly set?
         '-preset', 'ultrafast',
+        // this seems to be very picky about bitrate and fails easy.
+        // '-tune', 'zerolatency',
         "-bf", "0",
     ];
 }

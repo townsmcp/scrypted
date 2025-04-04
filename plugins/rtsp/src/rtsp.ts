@@ -1,31 +1,26 @@
-import sdk, { Setting, MediaObject, ScryptedInterface, FFmpegInput, PictureOptions, SettingValue, MediaStreamOptions, ResponseMediaStreamOptions, ScryptedMimeTypes, MediaStreamUrl } from "@scrypted/sdk";
-import { EventEmitter } from "stream";
-import { CameraProviderBase, CameraBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
+import { timeoutPromise } from '@scrypted/common/src/promise-utils';
+import sdk, { MediaObject, MediaStreamUrl, PictureOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue } from "@scrypted/sdk";
 import url from 'url';
+import { CameraBase, CameraProviderBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
 
 export { UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
 
-const { mediaManager } = sdk;
+export function createRtspMediaStreamOptions(url: string, index: number): UrlMediaStreamOptions {
+    return {
+        id: `channel${index}`,
+        name: `Stream ${index + 1}`,
+        url,
+        container: 'rtsp',
+        video: {
+        },
+        audio: {
 
+        },
+    };
+}
 export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
-    takePictureThrottled(option?: PictureOptions): Promise<MediaObject> {
+    takePicture(option?: PictureOptions): Promise<MediaObject> {
         throw new Error("The RTSP Camera does not provide snapshots. Install the Snapshot Plugin if snapshots are available via an URL.");
-    }
-
-    createRtspMediaStreamOptions(url: string, index: number): UrlMediaStreamOptions {
-        return {
-            id: `channel${index}`,
-            name: `Stream ${index + 1}`,
-            url,
-            container: 'rtsp',
-            video: {
-            },
-            audio: this.isAudioDisabled() ? null : {},
-        };
-    }
-
-    getChannelFromMediaStreamOptionsId(id: string) {
-        return id.substring('channel'.length);
     }
 
     getRawVideoStreamOptions(): UrlMediaStreamOptions[] {
@@ -43,7 +38,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
         }
 
         // filter out empty strings.
-        const ret = urls.filter(url => !!url).map((url, index) => this.createRtspMediaStreamOptions(url, index));
+        const ret = urls.filter(url => !!url).map((url, index) => createRtspMediaStreamOptions(url, index));
 
         if (!ret.length)
             return;
@@ -58,7 +53,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
         // Note the trailing colon.
         // issue: https://github.com/koush/scrypted/issues/134
         const parsedUrl = url.parse(rtspUrl);
-        this.console.log('rtsp stream url', rtspUrl);
+        this.console.log('stream url', rtspUrl);
         const username = this.storage.getItem("username");
         const password = this.storage.getItem("password");
         if (username) {
@@ -73,6 +68,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 
     createMediaStreamUrl(stringUrl: string, vso: ResponseMediaStreamOptions) {
         const ret: MediaStreamUrl = {
+            container: vso.container,
             url: stringUrl,
             mediaStreamOptions: vso,
         };
@@ -112,7 +108,19 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
     }
 
     async getOtherSettings(): Promise<Setting[]> {
-        return [];
+        const ret: Setting[] = [];
+
+        ret.push(
+            {
+                subgroup: 'Advanced',
+                key: 'debug',
+                title: 'Debug Events',
+                description: "Log all events to the console. This will be very noisy and should not be left enabled.",
+                value: this.storage.getItem('debug') === 'true',
+                type: 'boolean',
+            }
+        )
+        return ret;
     }
 
     async getUrlSettings(): Promise<Setting[]> {
@@ -123,6 +131,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 
     async putRtspUrls(urls: string[]) {
         this.storage.setItem('urls', JSON.stringify(urls.filter(url => !!url)));
+        this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
 
     async putSettingBase(key: string, value: SettingValue) {
@@ -136,16 +145,18 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 }
 
 export interface Destroyable {
+    on(eventName: string | symbol, listener: (...args: any[]) => void): void;
     destroy(): void;
+    emit(eventName: string | symbol, ...args: any[]): boolean;
 }
 
 export abstract class RtspSmartCamera extends RtspCamera {
     lastListen = 0;
-    listener: EventEmitter & Destroyable;
+    listener: Promise<Destroyable>;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
-        this.listenLoop();
+        process.nextTick(() => this.listenLoop());
     }
 
     resetSensors(): void {
@@ -159,25 +170,68 @@ export abstract class RtspSmartCamera extends RtspCamera {
             this.binaryState = false;
     }
 
-    listenLoop() {
+    async listenLoop() {
         this.resetSensors();
         this.lastListen = Date.now();
-        this.listener = this.listenEvents();
-        this.listener.on('error', e => {
-            this.console.error('listen loop error, restarting in 10 seconds', e);
+        if (this.listener)
+            return;
+
+        let listener: Destroyable;
+        const listenerPromise = this.listener = this.listenEvents();
+
+        let activityTimeout: NodeJS.Timeout;
+        const restartListener = () => {
+            if (listenerPromise === this.listener)
+                this.listener = undefined;
+            clearTimeout(activityTimeout);
+            listener?.destroy();
             const listenDuration = Date.now() - this.lastListen;
             const listenNext = listenDuration > 10000 ? 0 : 10000;
             setTimeout(() => this.listenLoop(), listenNext);
+        }
+
+        try {
+            listener = await this.listener;
+        }
+        catch (e) {
+            this.console.error('listen loop connection failed, restarting listener.', e.message);
+            restartListener();
+            return;
+        }
+
+        const resetActivityTimeout = () => {
+            clearTimeout(activityTimeout);
+            activityTimeout = setTimeout(() => {
+                this.console.error('listen loop 5m idle timeout, destroying listener.');
+                restartListener();
+            }, 300000);
+        }
+        resetActivityTimeout();
+
+        listener.on('data', (data) => {
+            if (this.storage.getItem('debug') === 'true')
+                this.console.log('debug event:\n', data.toString());
+            resetActivityTimeout();
+        });
+
+        listener.on('close', () => {
+            this.console.error('listen loop closed, restarting listener.');
+            restartListener();
+        });
+
+        listener.on('error', e => {
+            this.console.error('listen loop error, restarting listener.', e);
+            restartListener();
         });
     }
 
     async putSetting(key: string, value: SettingValue) {
         this.putSettingBase(key, value);
-        this.listener.emit('error', new Error("new settings"));
+        this.listener?.then(l => l.emit('error', new Error("new settings")));
     }
 
-    async takePictureThrottled(option?: PictureOptions) {
-        return this.takeSmartCameraPicture(option);;
+    async takePicture(options?: RequestPictureOptions) {
+        return this.takeSmartCameraPicture(options);
     }
 
     abstract takeSmartCameraPicture(options?: PictureOptions): Promise<MediaObject>;
@@ -204,7 +258,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
                 value: this.storage.getItem('ip'),
             },
             ...this.getHttpPortOverrideSettings(),
-            ...this.getRtspPortOverrideSettings(),
+            ...await this.getRtspPortOverrideSettings(),
         ];
 
         if (this.showRtspUrlOverride()) {
@@ -229,7 +283,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
         return [
             {
                 key: 'httpPort',
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 title: 'HTTP Port Override',
                 placeholder: '80',
                 value: this.storage.getItem('httpPort'),
@@ -241,14 +295,14 @@ export abstract class RtspSmartCamera extends RtspCamera {
         return true;
     }
 
-    getRtspPortOverrideSettings(): Setting[] {
+    async getRtspPortOverrideSettings(): Promise<Setting[]> {
         if (!this.showRtspPortOverride()) {
             return [];
         }
         return [
             {
                 key: 'rtspPort',
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 title: 'RTSP Port Override',
                 placeholder: '554',
                 value: this.storage.getItem('rtspPort'),
@@ -269,7 +323,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
     }
 
     setHttpPortOverride(port: string) {
-        this.storage.setItem('httpPort', port);
+        this.storage.setItem('httpPort', port || '');
     }
 
     getRtspUrlOverride() {
@@ -279,7 +333,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
     }
 
     abstract getConstructedVideoStreamOptions(): Promise<UrlMediaStreamOptions[]>;
-    abstract listenEvents(): EventEmitter & Destroyable;
+    abstract listenEvents(): Promise<Destroyable>;
 
     getIPAddress() {
         return this.storage.getItem('ip');
@@ -293,6 +347,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
         return `${this.getIPAddress()}:${this.storage.getItem('rtspPort') || 554}`;
     }
 
+    constructedVideoStreamOptions: Promise<UrlMediaStreamOptions[]>;
     async getVideoStreamOptions(): Promise<UrlMediaStreamOptions[]> {
         if (this.showRtspUrlOverride()) {
             const vsos = await super.getVideoStreamOptions();
@@ -300,12 +355,23 @@ export abstract class RtspSmartCamera extends RtspCamera {
                 return vsos;
         }
 
-        const vsos = await this.getConstructedVideoStreamOptions();
-        return vsos;
+        if (this.constructedVideoStreamOptions)
+            return this.constructedVideoStreamOptions;
+
+        this.constructedVideoStreamOptions = timeoutPromise(5000, this.getConstructedVideoStreamOptions()).finally(() => {
+            this.constructedVideoStreamOptions = undefined;
+        });
+
+        return this.constructedVideoStreamOptions;
+    }
+
+    putSettingBase(key: string, value: SettingValue): Promise<void> {
+        this.constructedVideoStreamOptions = undefined;
+        return super.putSettingBase(key, value);
     }
 }
 
-export class RtspProvider extends CameraProviderBase<UrlMediaStreamOptions> {
+export abstract class RtspProvider extends CameraProviderBase<UrlMediaStreamOptions> {
     createCamera(nativeId: string): RtspCamera {
         return new RtspCamera(nativeId, this);
     }

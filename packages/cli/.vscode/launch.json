@@ -6,7 +6,7 @@
     "configurations": [
         {
             "console": "integratedTerminal",
-            "type": "pwa-node",
+            "type": "node",
             "request": "launch",
             "name": "Launch Program",
             "skipFiles": [
@@ -19,9 +19,9 @@
                 "-r",
                 "ts-node/register"
             ],
+            "preLaunchTask": "npm: build",
             "args": [
-                "install",
-                "@scrypted/google-device-access"
+                "serve",
             ],
             "sourceMaps": true,
             "resolveSourceMapLocations": [

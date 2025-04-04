@@ -1,268 +1,258 @@
-import { ScryptedDeviceBase, HttpRequestHandler, HttpRequest, HttpResponse, EngineIOHandler, Device, DeviceProvider, ScryptedInterface, ScryptedDeviceType, RTCSignalingChannel, VideoCamera, VideoRecorder } from '@scrypted/sdk';
-import sdk from '@scrypted/sdk';
+import { readFileAsString, tsCompile } from '@scrypted/common/src/eval/scrypted-eval';
+import sdk, { DeviceProvider, HttpRequest, HttpRequestHandler, HttpResponse, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, SettingValue, Settings } from '@scrypted/sdk';
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
+import { writeFileSync } from 'fs';
+import path from 'path';
 import Router from 'router';
-import { UserStorage } from './userStorage';
-import { RpcPeer } from '../../../server/src/rpc';
-import { setupPluginRemote } from '../../../server/src/plugin/plugin-remote';
-import { PluginAPIProxy } from '../../../server/src/plugin/plugin-api';
-import fs from 'fs';
-import { sendJSON } from './http-helpers';
-import { Automation } from './automation';
-import { AggregateDevice, createAggregateDevice } from './aggregate';
-import net from 'net';
-import { updatePluginsData } from './update-plugins';
+import yaml from 'yaml';
+import { getUsableNetworkAddresses } from '../../../server/src/ip';
+import { AggregateCore, AggregateCoreNativeId } from './aggregate-core';
+import { AutomationCore, AutomationCoreNativeId } from './automations-core';
+import { LauncherMixin } from './launcher-mixin';
 import { MediaCore } from './media-core';
-import { createBrowserSignalingSession, isPeerConnectionAlive, startBrowserRTCSignaling, startRTCPeerConnectionForBrowser } from "@scrypted/common/src/ffmpeg-to-wrtc";
-import { ScriptCore, ScriptCoreNativeId } from './script-core';
+import { checkLegacyLxc, checkLxc } from './platform/lxc';
+import { ConsoleServiceNativeId, PluginSocketService, ReplServiceNativeId } from './plugin-socket-service';
+import { ScriptCore, ScriptCoreNativeId, newScript } from './script-core';
+import { TerminalService, TerminalServiceNativeId, newTerminalService } from './terminal-service';
+import { UsersCore, UsersNativeId } from './user';
+import { ClusterCore, ClusterCoreNativeId } from './cluster';
 
-const { pluginHostAPI, systemManager, deviceManager, mediaManager, endpointManager } = sdk;
-
-const indexHtml = fs.readFileSync('dist/index.html').toString();
+const { deviceManager, endpointManager } = sdk;
 
 interface RoutedHttpRequest extends HttpRequest {
     params: { [key: string]: string };
 }
 
-async function reportAutomation(nativeId: string, name?: string) {
-    const device: Device = {
-        name,
-        nativeId,
-        type: ScryptedDeviceType.Automation,
-        interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Settings]
-    }
-    await deviceManager.onDeviceDiscovered(device);
-}
-
-
-async function reportAggregate(nativeId: string, interfaces: string[]) {
-    const device: Device = {
-        name: undefined,
-        nativeId,
-        type: ScryptedDeviceType.Unknown,
-        interfaces,
-    }
-    await deviceManager.onDeviceDiscovered(device);
-}
-
-class ScryptedCore extends ScryptedDeviceBase implements HttpRequestHandler, EngineIOHandler, DeviceProvider {
+class ScryptedCore extends ScryptedDeviceBase implements HttpRequestHandler, DeviceProvider, Settings {
     router: any = Router();
     publicRouter: any = Router();
     mediaCore: MediaCore;
     scriptCore: ScriptCore;
-    automations = new Map<string, Automation>();
-    aggregate = new Map<string, AggregateDevice>();
+    clusterCore: ClusterCore;
+    aggregateCore: AggregateCore;
+    automationCore: AutomationCore;
+    users: UsersCore;
+    consoleService: PluginSocketService;
+    replService: PluginSocketService;
+    terminalService: TerminalService;
+    localAddresses: string[];
+    storageSettings = new StorageSettings(this, {
+        localAddresses: {
+            title: 'Scrypted Server Addresses',
+            description: 'The IP addresses used by the Scrypted server. Set this to the wired IP address to prevent usage of a wireless address.',
+            combobox: true,
+            multiple: true,
+            async onGet() {
+                return {
+                    choices: getUsableNetworkAddresses(),
+                };
+            },
+            mapGet: () => this.localAddresses,
+            onPut: async (oldValue, newValue) => {
+                this.localAddresses = newValue?.length ? newValue : undefined;
+                const service = await sdk.systemManager.getComponent('addresses');
+                service.setLocalAddresses(this.localAddresses);
+            },
+        },
+        releaseChannel: {
+            group: 'Advanced',
+            title: 'Server Release Channel',
+            description: 'The release channel to use for server updates. A specific version or tag can be manually entered as well. Changing this setting will update the image field in /root/.scrypted/docker-compose.yml. Invalid values may prevent the server from properly starting.',
+            defaultValue: 'Default',
+            choices: [
+                'Default',
+                'latest',
+                'beta',
+                `v${sdk.serverVersion}-jammy-full`,
+            ],
+            combobox: true,
+            onPut: (ov, nv) => {
+                this.updateReleaseChannel(nv);
+            },
+            mapGet: () => {
+                try {
+                    const dockerCompose = yaml.parseDocument(readFileAsString('/root/.scrypted/docker-compose.yml'));
+                    // @ts-ignore
+                    const image: string = dockerCompose.contents.get('services').get('scrypted').get('image');
+                    const label = image.split(':')[1] || undefined;
+                    return label || 'Default';
+                }
+                catch (e) {
+                    return 'Default';
+                }
+            }
+        },
+        pullImage: {
+            hide: true,
+            onPut: () => {
+                this.setPullImage();
+            }
+        },
+    });
+    indexHtml: string;
 
     constructor() {
         super();
 
+        this.systemDevice = {
+            settings: "General",
+        }
+
+        checkLegacyLxc();
+        checkLxc();
+
+        this.storageSettings.settings.releaseChannel.hide = process.env.SCRYPTED_INSTALL_ENVIRONMENT !== 'lxc-docker';
+
+        this.indexHtml = readFileAsString('dist/index.html');
+
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Cluster Manager',
+                    nativeId: ClusterCoreNativeId,
+                    interfaces: [ScryptedInterface.Settings, ScryptedInterface.Readme, ScryptedInterface.ScryptedSettings],
+                    type: ScryptedDeviceType.Builtin,
+                },
+            );
+        })();
         (async () => {
             await deviceManager.onDeviceDiscovered(
                 {
                     name: 'Media Core',
                     nativeId: 'mediacore',
-                    interfaces: [ScryptedInterface.DeviceProvider, ScryptedInterface.BufferConverter],
-                    type: ScryptedDeviceType.API,
+                    interfaces: [ScryptedInterface.DeviceProvider, ScryptedInterface.BufferConverter, ScryptedInterface.HttpRequestHandler],
+                    type: ScryptedDeviceType.Internal,
                 },
             );
-            this.mediaCore = new MediaCore('mediacore');
         })();
         (async () => {
             await deviceManager.onDeviceDiscovered(
                 {
-                    name: 'Scripting Core',
+                    name: 'Scripts',
                     nativeId: ScriptCoreNativeId,
-                    interfaces: [ScryptedInterface.DeviceProvider, ScryptedInterface.DeviceCreator, ScryptedInterface.Readme],
-                    type: ScryptedDeviceType.API,
+                    interfaces: [ScryptedInterface.ScryptedSystemDevice, ScryptedInterface.ScryptedDeviceCreator, ScryptedInterface.DeviceProvider, ScryptedInterface.DeviceCreator, ScryptedInterface.Readme],
+                    type: ScryptedDeviceType.Internal,
                 },
             );
-            this.scriptCore = new ScriptCore(ScriptCoreNativeId);
         })();
-
-        for (const nativeId of deviceManager.getNativeIds()) {
-            if (nativeId?.startsWith('automation:')) {
-                const automation = new Automation(nativeId);
-                this.automations.set(nativeId, automation);
-                reportAutomation(nativeId, automation.providedName);
-            }
-            else if (nativeId?.startsWith('aggregate:')) {
-                const aggregate = createAggregateDevice(nativeId);
-                this.aggregate.set(nativeId, aggregate);
-                reportAggregate(nativeId, aggregate.computeInterfaces());
-            }
-        }
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Terminal Service',
+                    nativeId: TerminalServiceNativeId,
+                    interfaces: [ScryptedInterface.StreamService, ScryptedInterface.TTY, ScryptedInterface.ClusterForkInterface],
+                    type: ScryptedDeviceType.Internal,
+                },
+            );
+        })();
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'REPL Service',
+                    nativeId: ReplServiceNativeId,
+                    interfaces: [ScryptedInterface.StreamService],
+                    type: ScryptedDeviceType.Internal,
+                },
+            );
+        })();
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Console Service',
+                    nativeId: ConsoleServiceNativeId,
+                    interfaces: [ScryptedInterface.StreamService],
+                    type: ScryptedDeviceType.Internal,
+                },
+            );
+        })();
 
         (async () => {
-            const updatePluginsNativeId = 'automation:update-plugins'
-            let updatePlugins = this.automations.get(updatePluginsNativeId);
-            if (!updatePlugins) {
-                await reportAutomation(updatePluginsNativeId, 'Autoupdate Plugins');
-                updatePlugins = new Automation(updatePluginsNativeId);
-                updatePlugins.storage.setItem('data', JSON.stringify(updatePluginsData));
-                this.automations.set(updatePluginsNativeId, updatePlugins);
-            }
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Automations',
+                    nativeId: AutomationCoreNativeId,
+                    interfaces: [ScryptedInterface.ScryptedSystemDevice, ScryptedInterface.ScryptedDeviceCreator, ScryptedInterface.DeviceProvider, ScryptedInterface.DeviceCreator, ScryptedInterface.Readme],
+                    type: ScryptedDeviceType.Internal,
+                },
+            );
         })();
 
-        this.router.post('/api/new/automation', async (req: RoutedHttpRequest, res: HttpResponse) => {
-            const nativeId = `automation:${Math.random()}`;
-            await reportAutomation(nativeId);
-            const automation = new Automation(nativeId);
-            this.automations.set(nativeId, automation);
-            const { id } = automation;
-            sendJSON(res, {
-                id,
-            });
+        deviceManager.onDeviceDiscovered({
+            name: 'Add to Launcher',
+            nativeId: 'launcher',
+            interfaces: [
+                '@scrypted/launcher-ignore',
+                ScryptedInterface.MixinProvider,
+                ScryptedInterface.Readme,
+            ],
+            type: ScryptedDeviceType.Internal,
         });
 
-        this.router.post('/api/new/aggregate', async (req: RoutedHttpRequest, res: HttpResponse) => {
-            const nativeId = `aggregate:${Math.random()}`;
-            await reportAggregate(nativeId, []);
-            const aggregate = createAggregateDevice(nativeId);
-            this.aggregate.set(nativeId, aggregate);
-            const { id } = aggregate;
-            sendJSON(res, {
-                id,
-            });
-        });
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Device Groups',
+                    nativeId: AggregateCoreNativeId,
+                    interfaces: [ScryptedInterface.ScryptedSystemDevice, ScryptedInterface.ScryptedDeviceCreator, ScryptedInterface.DeviceProvider, ScryptedInterface.DeviceCreator, ScryptedInterface.Readme],
+                    type: ScryptedDeviceType.Builtin,
+                },
+            );
+        })();
 
-        // update the automations and grouped devices on storage change.
-        systemManager.listen((eventSource, eventDetails, eventData) => {
-            if (eventDetails.eventInterface === 'Storage') {
-                let ids = [...this.automations.values()].map(a => a.id);
-                if (ids.includes(eventSource.id)) {
-                    const automation = [...this.automations.values()].find(a => a.id === eventSource.id);
-                    automation.bind();
-                }
-                ids = [...this.aggregate.values()].map(a => a.id);
-                if (ids.includes(eventSource.id)) {
-                    const aggregate = [...this.aggregate.values()].find(a => a.id === eventSource.id);
-                    reportAggregate(aggregate.nativeId, aggregate.computeInterfaces());
-                }
-            }
-        });
+
+        (async () => {
+            await deviceManager.onDeviceDiscovered(
+                {
+                    name: 'Scrypted Users',
+                    nativeId: UsersNativeId,
+                    interfaces: [ScryptedInterface.ScryptedSystemDevice, ScryptedInterface.ScryptedDeviceCreator, ScryptedInterface.DeviceProvider, ScryptedInterface.DeviceCreator, ScryptedInterface.Readme],
+                    type: ScryptedDeviceType.Internal,
+                },
+            );
+        })();
+    }
+
+    async getSettings(): Promise<Setting[]> {
+        try {
+            const service = await sdk.systemManager.getComponent('addresses');
+            this.localAddresses = await service.getLocalAddresses(true);
+        }
+        catch (e) {
+        }
+        return this.storageSettings.getSettings();
+    }
+
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        await this.storageSettings.putSetting(key, value);
     }
 
     async getDevice(nativeId: string) {
+        if (nativeId === ClusterCoreNativeId)
+            return this.clusterCore ||= new ClusterCore(ClusterCoreNativeId);
+        if (nativeId === 'launcher')
+            return new LauncherMixin('launcher');
         if (nativeId === 'mediacore')
-            return this.mediaCore;
+            return this.mediaCore ||= new MediaCore();
         if (nativeId === ScriptCoreNativeId)
-            return this.scriptCore;
-        if (nativeId?.startsWith('automation:'))
-            return this.automations.get(nativeId);
-        if (nativeId?.startsWith('aggregate:'))
-            return this.aggregate.get(nativeId);
+            return this.scriptCore ||= new ScriptCore();
+        if (nativeId === AutomationCoreNativeId)
+            return this.automationCore ||= new AutomationCore()
+        if (nativeId === AggregateCoreNativeId)
+            return this.aggregateCore ||= new AggregateCore();
+        if (nativeId === UsersNativeId)
+            return this.users ||= new UsersCore();
+        if (nativeId === TerminalServiceNativeId)
+            return this.terminalService ||= new TerminalService(TerminalServiceNativeId, false);
+        if (nativeId === ReplServiceNativeId)
+            return this.replService ||= new PluginSocketService(ReplServiceNativeId, 'repl');
+        if (nativeId === ConsoleServiceNativeId)
+            return this.consoleService ||= new PluginSocketService(ConsoleServiceNativeId, 'console');
     }
 
-    checkEngineIoEndpoint(request: HttpRequest, name: string) {
-        const check = `/endpoint/@scrypted/core/engine.io/${name}/`;
-        if (!request.url.startsWith(check))
-            return null;
-        return check;
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
     }
 
-    async checkService(request: HttpRequest, ws: WebSocket, name: string): Promise<boolean> {
-        const check = this.checkEngineIoEndpoint(request, name);
-        if (!check)
-            return false;
-        const deviceId = request.url.substr(check.length).split('/')[0];
-        const plugins = await systemManager.getComponent('plugins');
-        const { nativeId, pluginId } = await plugins.getDeviceInfo(deviceId);
-        const port = await plugins.getRemoteServicePort(pluginId, name);
-        const socket = net.connect(port);
-        socket.on('close', () => ws.close());
-        socket.on('data', data => ws.send(data));
-        socket.resume();
-        socket.write(nativeId?.toString() || 'undefined');
-        ws.onclose = () => socket.destroy();
-        ws.onmessage = message => socket.write(message.data);
-        return true;
-    }
-
-    async onConnection(request: HttpRequest, webSocketUrl: string): Promise<void> {
-        const ws = new WebSocket(webSocketUrl);
-
-        if (await this.checkService(request, ws, 'console') || await this.checkService(request, ws, 'repl')) {
-            return;
-        }
-
-        const attachPeerConnection = (pc: RTCPeerConnection) => {
-            if (!pc)
-                return;
-            const checkConn = () => {
-                if (!isPeerConnectionAlive(pc))
-                    ws.close();
-            }
-            ws.addEventListener('close', () => pc.close());
-            pc.addEventListener('connectionstatechange', checkConn);
-            pc.addEventListener('iceconnectionstatechange', checkConn);
-        }
-
-        // 3/3/2022 todo: can remove this. leaving this around because
-        // cached ui will hit this endpoint.
-        if (this.checkEngineIoEndpoint(request, 'videocamera')) {
-            const url = new URL(`http://localhost${request.url}`);
-            const deviceId = url.searchParams.get('deviceId');
-            const camera = systemManager.getDeviceById<VideoCamera & RTCSignalingChannel>(deviceId);
-            if (!camera) {
-                ws.close();
-            }
-            else {
-                const pc = await startBrowserRTCSignaling(camera, ws, this.console);
-                // todo, pc is null if it's an rtc signaling channel. do we care?
-                attachPeerConnection(pc);
-            }
-            return;
-        }
-
-        // 3/3/2022 todo: can remove this. leaving this around because
-        // cached ui will hit this endpoint.
-        if (this.checkEngineIoEndpoint(request, 'videorecorder')) {
-            const url = new URL(`http://localhost${request.url}`);
-            const deviceId = url.searchParams.get('deviceId');
-            const startTime = parseInt(url.searchParams.get('startTime'));
-            const camera = systemManager.getDeviceById<VideoRecorder>(deviceId);
-            if (!camera) {
-                ws.close();
-            }
-            else {
-                const session = await createBrowserSignalingSession(ws);
-                const options = await session.getOptions();
-
-                const pc = await startRTCPeerConnectionForBrowser(this.console, await camera.getRecordingStream({
-                    id: undefined,
-                    startTime,
-                }), session, options);
-
-                attachPeerConnection(pc);
-            }
-            return;
-        }
-
-        if (request.isPublicEndpoint) {
-            ws.close();
-            return;
-        }
-
-        const peer = new RpcPeer("core", "web", message => ws.send(JSON.stringify(message)));
-        ws.onmessage = message => peer.handleMessage(JSON.parse(message.data));
-        const userStorage = new UserStorage(request.username);
-        peer.params.userStorage = userStorage;
-
-        const api = new PluginAPIProxy(pluginHostAPI, mediaManager);
-
-        ws.onclose = () => {
-            peer.kill('engine.io connection closed.')
-            api.removeListeners();
-        }
-
-        try {
-            await setupPluginRemote(peer, api, null, () => systemManager.getSystemState());
-        }
-        catch (e) {
-            ws.close();
-        }
-    }
-
-    handlePublicFinal(request: HttpRequest, response: HttpResponse) {
+    async handlePublicFinal(request: HttpRequest, response: HttpResponse) {
         // need to strip off the query.
         const incomingPathname = request.url.split('?')[0];
         if (request.url !== '/index.html') {
@@ -272,24 +262,24 @@ class ScryptedCore extends ScryptedDeviceBase implements HttpRequestHandler, Eng
 
         // the rel hrefs (manifest, icons) are pulled in a web worker which does not
         // have cookies. need to attach auth info to them.
-        endpointManager.getPublicCloudEndpoint()
-            .then(endpoint => {
-                const u = new URL(endpoint);
+        try {
+            const endpoint = await endpointManager.getPublicCloudEndpoint();
+            const u = new URL(endpoint);
 
-                const rewritten = indexHtml
-                    .replace('href="/endpoint/@scrypted/core/public/manifest.json"', `href="/endpoint/@scrypted/core/public/manifest.json${u.search}"`)
-                    .replace('href="/endpoint/@scrypted/core/public/img/icons/apple-touch-icon-152x152.png"', `href="/endpoint/@scrypted/core/public/img/icons/apple-touch-icon-152x152.png${u.search}"`)
-                    .replace('href="/endpoint/@scrypted/core/public/img/icons/safari-pinned-tab.svg"', `href="/endpoint/@scrypted/core/public/img/icons/safari-pinned-tab.svg${u.search}"`)
-                    ;
-                response.send(rewritten, {
-                    headers: {
-                        'Content-Type': 'text/html',
-                    }
-                });
-            })
-            .catch(() => {
-                response.sendFile("dist" + incomingPathname);
+            const rewritten = this.indexHtml
+                .replace('href="manifest.json"', `href="manifest.json${u.search}"`)
+                .replace('href="img/icons/apple-touch-icon-152x152.png"', `href="img/icons/apple-touch-icon-152x152.png${u.search}"`)
+                .replace('href="img/icons/safari-pinned-tab.svg"', `href="img/icons/safari-pinned-tab.svg${u.search}"`)
+                ;
+            response.send(rewritten, {
+                headers: {
+                    'Content-Type': 'text/html',
+                }
             });
+        }
+        catch (e) {
+            response.sendFile("dist" + incomingPathname);
+        }
     }
 
     async onRequest(request: HttpRequest, response: HttpResponse) {
@@ -302,16 +292,45 @@ class ScryptedCore extends ScryptedDeviceBase implements HttpRequestHandler, Eng
         }
 
         if (request.isPublicEndpoint) {
-            this.publicRouter(normalizedRequest, response, () => this.handlePublicFinal(normalizedRequest, response));
+            await new Promise(resolve => this.publicRouter(normalizedRequest, response, resolve));
+            await this.handlePublicFinal(normalizedRequest, response);
         }
         else {
-            this.router(normalizedRequest, response, () => {
-                response.send('Not Found', {
-                    code: 404,
-                });
+            await new Promise(resolve => this.router(normalizedRequest, response, resolve));
+            response.send('Not Found', {
+                code: 404,
             });
         }
     }
+
+    setPullImage() {
+        writeFileSync(path.join(process.env.SCRYPTED_VOLUME, '.pull'), '');
+    }
+
+    async updateReleaseChannel(releaseChannel: string) {
+        if (!releaseChannel || releaseChannel === 'Default')
+            releaseChannel = '';
+        else
+            releaseChannel = `:${releaseChannel}`;
+        const dockerCompose = yaml.parseDocument(readFileAsString('/root/.scrypted/docker-compose.yml'));
+        // @ts-ignore
+        dockerCompose.contents.get('services').get('scrypted').set('image', `ghcr.io/koush/scrypted${releaseChannel}`);
+        yaml.stringify(dockerCompose);
+        writeFileSync('/root/.scrypted/docker-compose.yml', yaml.stringify(dockerCompose));
+        this.setPullImage();
+
+        const serviceControl = await sdk.systemManager.getComponent("service-control");
+        await serviceControl.exit().catch(() => { });
+        await serviceControl.restart();
+    }
 }
 
-export default new ScryptedCore();
+export default ScryptedCore;
+
+export async function fork() {
+    return {
+        tsCompile,
+        newScript,
+        newTerminalService,
+    }
+}

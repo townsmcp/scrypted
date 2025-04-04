@@ -1,5 +1,5 @@
-import { ScryptedNativeId, SystemDeviceState } from '@scrypted/types'
-import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
+import { EventDetails, ScryptedNativeId, SystemDeviceState } from '@scrypted/types'
+import { PluginRemote, PluginRemoteLoadZipOptions, PluginZipAPI } from './plugin-api';
 
 /**
  * This remote is necessary as the host needs to create a remote synchronously
@@ -15,12 +15,13 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
             this.remote = await remoteReadyPromise;
             return this.remote;
         })();
+        this.remoteReadyPromise.catch(() => {});
     }
 
-    async loadZip(packageJson: any, zipData: Buffer|string, options?: PluginRemoteLoadZipOptions): Promise<any> {
+    async loadZip(packageJson: any, zipAPI: PluginZipAPI, options?: PluginRemoteLoadZipOptions): Promise<any> {
         if (!this.remote)
             await this.remoteReadyPromise;
-        return this.remote.loadZip(packageJson, zipData, options);
+        return this.remote.loadZip(packageJson, zipAPI, options);
     }
     async setSystemState(state: { [id: string]: { [property: string]: SystemDeviceState; }; }): Promise<void> {
         if (!this.remote)
@@ -42,7 +43,9 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
         }
         return this.remote.updateDeviceState(id, state);
     }
-    async notify(id: string, eventTime: number, eventInterface: string, property: string, propertyState: SystemDeviceState, changed?: boolean): Promise<void> {
+    // TODO: deprecate/clean up this signature
+    // 12/30/2022
+    async notify(id: string, eventTimeOrDetails: number| EventDetails, eventInterfaceOrData: string | SystemDeviceState | any, property?: string, value?: SystemDeviceState | any, changed?: boolean) {
         try {
             if (!this.remote)
                 await this.remoteReadyPromise;
@@ -50,7 +53,7 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
         catch (e) {
             return;
         }
-        return this.remote.notify(id, eventTime, eventInterface, property, propertyState, changed);
+        return this.remote.notify(id, eventTimeOrDetails as any, eventInterfaceOrData, property, value, changed);
     }
     async ioEvent(id: string, event: string, message?: any): Promise<void> {
         if (!this.remote)
@@ -63,7 +66,7 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
         return this.remote.createDeviceState(id, setState);
     }
 
-    async getServicePort(name: string, ...args: any[]): Promise<number> {
+    async getServicePort(name: string, ...args: any[]): Promise<[number, string]> {
         const remote = await this.remotePromise;
         return remote.getServicePort(name, ...args);
     }

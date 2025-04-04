@@ -1,10 +1,27 @@
-import type { RtpPacket } from "@koush/werift-src/packages/rtp/src/rtp/rtp";
+/**
+ * This is a subset of Werift's RtpPacket.
+ */
+export interface RtpPacket {
+    payload: Buffer;
+    header: {
+        padding: boolean;
+        marker: boolean;
+        timestamp: number;
+        sequenceNumber: number;
+    };
+    clone(): RtpPacket;
+    serialize(): Buffer;
+}
 
 export function sequenceNumberDistance(s1: number, s2: number): number {
     if (s2 === s1)
         return 0;
     const distance = s2 - s1;
-    const rolloverDistance = s1 + 0x10000 - s2;
+    let rolloverDistance: number;
+    if (s2 > s1)
+        rolloverDistance = s1 + 0x10000 - s2;
+    else
+        rolloverDistance = s2 + 0x10000 - s1;
 
     if (Math.abs(distance) < Math.abs(rolloverDistance))
         return distance;
@@ -15,6 +32,11 @@ export function nextSequenceNumber(current: number, increment = 1) {
     return (current + increment + 0x10000) % 0x10000;
 }
 
+const maxRtpTimestamp = BigInt(0xFFFFFFFF);
+export function addRtpTimestamp(current: number, adjust: number) {
+    return Number(maxRtpTimestamp & (BigInt(current) + BigInt(adjust)));
+}
+
 export function isNextSequenceNumber(current: number, next: number) {
     return nextSequenceNumber(current) === next;
 }
@@ -23,7 +45,7 @@ export class JitterBuffer {
     lastSequenceNumber: number;
     pending: RtpPacket[] = [];
 
-    constructor(public console: Console, public jitterSize: number, ) {
+    constructor(public console: Console, public jitterSize: number,) {
     }
 
     flushPending(afterSequenceNumber: number, ret: RtpPacket[]): RtpPacket[] {
@@ -73,7 +95,7 @@ export class JitterBuffer {
 
         // missed/late bunch of packets
         if (packetDistance > this.jitterSize) {
-            this.console.log('jitter buffer skipped packets:', packetDistance);
+            // this.console.log('jitter buffer skipped packets:', packetDistance);
             const { lastSequenceNumber } = this;
             this.lastSequenceNumber = sequenceNumber - this.jitterSize;
             // use the previous sequence number to flush any packets that are too old compared

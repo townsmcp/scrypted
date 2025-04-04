@@ -1,4 +1,4 @@
-import { Device, DeviceManifest, EventDetails, EventListenerOptions, EventListenerRegister, HttpRequest, MediaManager, ScryptedDevice, ScryptedInterfaceDescriptor, ScryptedInterfaceProperty, ScryptedNativeId } from '@scrypted/types';
+import { Device, DeviceManifest, EndpointAccessControlAllowOrigin, EventDetails, EventListenerOptions, EventListenerRegister, MediaManager, ScryptedDevice, ScryptedInterfaceDescriptor, ScryptedInterfaceProperty, ScryptedNativeId } from '@scrypted/types';
 import debounce from 'lodash/debounce';
 import { Plugin } from '../db-types';
 import { Logger } from '../logger';
@@ -20,24 +20,25 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
         'onMixinEvent',
         'onDeviceEvent',
         'setStorage',
-        'ioSend',
-        'ioClose',
         'setDeviceProperty',
-        'deliverPush',
         'requestRestart',
         "setState",
     ];
 
     restartDebounced = debounce(async () => {
+        const plugin = await this.scrypted.datastore.tryGet(Plugin, this.pluginId);
         const host = this.scrypted.plugins[this.pluginId];
-        const logger = await this.getLogger(undefined);
-        if (host.api !== this) {
+        if (!plugin) {
+            const logger = await this.getLogger(undefined);
+            logger.log('w', 'plugin restart was requested, but plugin was not found. restart cancelled.');
+            return;
+        }
+        if (host?.api !== this) {
+            const logger = await this.getLogger(undefined);
             logger.log('w', 'plugin restart was requested, but a different instance was found. restart cancelled.');
             return;
         }
-
-        const plugin = await this.scrypted.datastore.tryGet(Plugin, this.pluginId);
-        this.scrypted.runPlugin(plugin);
+        await this.scrypted.runPlugin(plugin);
     }, 15000);
 
     constructor(public scrypted: ScryptedRuntime, pluginId: string, public pluginHost: PluginHost, public mediaManager: MediaManager) {
@@ -47,7 +48,7 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
 
     // do we care about mixin validation here?
     // maybe to prevent/notify errant dangling events?
-    async onMixinEvent(id: string, nativeIdOrMixinDevice: ScryptedNativeId | any, eventInterface: any, eventData?: any) {
+    async onMixinEvent(id: string, nativeIdOrMixinDevice: ScryptedNativeId | any, eventInterface: string, eventData?: any) {
         // nativeId code path has been deprecated in favor of mixin object 12/10/2021
         const device = this.scrypted.findPluginDeviceById(id);
 
@@ -64,22 +65,24 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
             const { interfaces } = await tableEntry.entry;
             if (!interfaces.has(eventInterface))
                 throw new Error(`${mixinProvider._id} does not mixin ${eventInterface} for ${id}`);
+
+            this.scrypted.stateManager.notifyInterfaceEvent(device, eventInterface, eventData);
         }
         else {
             const mixin: object = nativeIdOrMixinDevice;
-            if (!await this.scrypted.devices[device._id]?.handler?.isMixin(id, mixin)) {
+            let mixinProviderId = await this.scrypted.devices[device._id]?.handler?.getMixinProviderId(id, mixin);
+            if (!mixinProviderId)
                 throw new Error(`${mixin} does not mixin ${eventInterface} for ${id}`);
-            }
+
+            if (mixinProviderId === true)
+                mixinProviderId = undefined;
+            // this.scrypted.stateManager.notifyInterfaceEvent(device, eventInterface, eventData);
+            this.scrypted.stateManager.notifyInterfaceEventFromMixin(device, eventInterface, eventData, mixinProviderId as string);
         }
-        this.scrypted.stateManager.notifyInterfaceEvent(device, eventInterface, eventData);
     }
 
     async getMediaManager(): Promise<MediaManager> {
         return this.mediaManager;
-    }
-
-    async deliverPush(endpoint: string, httpRequest: HttpRequest) {
-        return this.scrypted.deliverPush(endpoint, httpRequest);
     }
 
     async getLogger(nativeId: ScryptedNativeId): Promise<Logger> {
@@ -87,7 +90,16 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
         return this.scrypted.getDeviceLogger(device);
     }
 
-    getComponent(id: string): Promise<any> {
+    async getComponent(id: string): Promise<any> {
+        if (id === 'setAccessControlAllowOrigin') {
+            return async (options: EndpointAccessControlAllowOrigin) => {
+                const { nativeId, origins } = options;
+                const device = this.scrypted.findPluginDevice(this.pluginId, nativeId);
+                if (!device)
+                    throw new Error(`device not found for plugin id ${this.pluginId} native id ${nativeId}`);
+                return this.scrypted.corsControl.setCORS(device._id, origins);
+            }
+        }
         return this.scrypted.getComponent(id);
     }
 
@@ -105,28 +117,19 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
         }
     }
 
-    async ioClose(id: string) {
-        // @ts-expect-error
-        this.pluginHost.io.clients[id]?.close();
-        this.pluginHost.ws[id]?.close();
-    }
-
-    async ioSend(id: string, message: string) {
-        // @ts-expect-error
-        this.pluginHost.io.clients[id]?.send(message);
-        this.pluginHost.ws[id]?.send(message);
-    }
-
     async setState(nativeId: ScryptedNativeId, key: string, value: any) {
         checkProperty(key, value);
-        this.scrypted.stateManager.setPluginState(this.pluginId, nativeId, this.propertyInterfaces?.[key], key, value);
+        const { pluginId } = this;
+        const device = this.scrypted.findPluginDevice(pluginId, nativeId);
+        if (!device)
+            throw new Error(`device not found for plugin id ${pluginId} native id ${nativeId}`);
+        await this.scrypted.stateManager.setPluginDeviceStateFromMixin(device, key, value, this.propertyInterfaces?.[key], device._id);
     }
 
     async setStorage(nativeId: ScryptedNativeId, storage: { [key: string]: string }) {
         const device = this.scrypted.findPluginDevice(this.pluginId, nativeId)
         device.storage = storage;
         this.scrypted.datastore.upsert(device);
-        this.scrypted.stateManager.notifyInterfaceEvent(device, 'Storage', undefined);
     }
 
     async onDevicesChanged(deviceManifest: DeviceManifest) {
@@ -141,12 +144,15 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
 
         for (const upsert of deviceManifest.devices) {
             upsert.providerNativeId = deviceManifest.providerNativeId;
-            await this.pluginHost.upsertDevice(upsert);
+            const id = await this.pluginHost.upsertDevice(upsert);
+            this.scrypted.getDevice(id)?.probe().catch(() => { });
         }
     }
 
     async onDeviceDiscovered(device: Device) {
-        return this.pluginHost.upsertDevice(device);
+        const id = await this.pluginHost.upsertDevice(device);
+        this.scrypted.getDevice(id)?.probe().catch(() => { });
+        return id;
     }
 
     async onDeviceRemoved(nativeId: string) {
@@ -155,7 +161,7 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
 
     async onDeviceEvent(nativeId: any, eventInterface: any, eventData?: any) {
         const plugin = this.scrypted.findPluginDevice(this.pluginId, nativeId);
-        this.scrypted.stateManager.notifyInterfaceEvent(plugin, eventInterface, eventData);
+        this.scrypted.stateManager.notifyInterfaceEventFromMixin(plugin, eventInterface, eventData, plugin._id);
     }
 
     async getDeviceById<T>(id: string): Promise<T & ScryptedDevice> {
@@ -165,11 +171,11 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
         return this.manageListener(this.scrypted.stateManager.listen(callback));
     }
     async listenDevice(id: string, event: string | EventListenerOptions, callback: (eventDetails: EventDetails, eventData: any) => void): Promise<EventListenerRegister> {
-        const device = this.scrypted.findPluginDeviceById(id);
-        if (device) {
-            const self = this.scrypted.findPluginDevice(this.pluginId);
-            this.scrypted.getDeviceLogger(self).log('i', `requested listen ${getState(device, ScryptedInterfaceProperty.name)} ${JSON.stringify(event)}`);
-        }
+        // const device = this.scrypted.findPluginDeviceById(id);
+        // if (device) {
+        //     const self = this.scrypted.findPluginDevice(this.pluginId);
+        //     this.scrypted.getDeviceLogger(self).log('i', `requested listen ${getState(device, ScryptedInterfaceProperty.name)} ${JSON.stringify(event)}`);
+        // }
         return this.manageListener(this.scrypted.stateManager.listenDevice(id, event, callback));
     }
 
@@ -179,7 +185,7 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
 
     async requestRestart() {
         const logger = await this.getLogger(undefined);
-        logger.log('i', 'plugin restart was requested');
+        logger?.log('i', 'plugin restart was requested');
         return this.restartDebounced();
     }
 

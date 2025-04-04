@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/tensorflow-lite",
-   "description": "Scrypted Object Detection Service.",
+   "description": "Scrypted Tensorflow Lite Object Detection",
    "keywords": [
       "scrypted",
       "plugin",
@@ -29,15 +29,35 @@
       "scrypted-package-json": "scrypted-package-json"
    },
    "scrypted": {
-      "name": "TensorFlow Lite (and Coral) Object Detection",
+      "name": "Tensorflow Lite Object Detection",
+      "pluginDependencies": [
+         "@scrypted/objectdetector"
+      ],
       "runtime": "python",
+      "pythonVersion": {
+         "default": "3.9",
+         "darwin": {
+            "arm64": "3.10"
+         },
+         "win32": {
+            "x64": "3.9"
+         }
+      },
       "type": "API",
       "interfaces": [
-         "ObjectDetection"
-      ]
+         "Settings",
+         "ClusterForkInterface",
+         "ObjectDetection",
+         "ObjectDetectionPreview"
+      ],
+      "labels": {
+         "require": [
+            "@scrypted/tensorflow-lite"
+         ]
+      }
    },
    "devDependencies": {
       "@scrypted/sdk": "file:../../sdk"
    },
-   "version": "0.0.36"
+   "version": "0.1.78"
 }

@@ -8,8 +8,8 @@ import dgram from 'dgram';
 import { AudioStreamingSamplerate } from '../../hap';
 import { ntpTime } from './camera-utils';
 import { H264Repacketizer } from './h264-packetizer';
-import { JitterBuffer } from './jitter-buffer';
 import { OpusRepacketizer } from './opus-repacketizer';
+import throttle from 'lodash/throttle';
 
 export function createCameraStreamSender(console: Console, config: Config, sender: dgram.Socket, ssrc: number, payloadType: number, port: number, targetAddress: string, rtcpInterval: number,
     videoOptions?: {
@@ -31,11 +31,20 @@ export function createCameraStreamSender(console: Console, config: Config, sende
     let octetCount = 0;
     let lastRtcp = 0;
     let firstSequenceNumber: number;
-    let allowRollover = false;
-    let rolloverCount = 0;
     let opusPacketizer: OpusRepacketizer;
     let h264Packetizer: H264Repacketizer;
     let analyzeVideo = true;
+
+    const loggedNaluTypes = new Set<number>();
+    const printNaluTypes = () => {
+        if (!loggedNaluTypes.size)
+            return;
+        console.log('scanning for idr start found:', ...[...loggedNaluTypes]);
+        loggedNaluTypes.clear();
+    };
+    const logIdrCheck = throttle(() => {
+        printNaluTypes();
+    }, 1000);
 
     let audioIntervalScale = 1;
     if (audioOptions) {
@@ -51,9 +60,11 @@ export function createCameraStreamSender(console: Console, config: Config, sende
         opusPacketizer = new OpusRepacketizer(audioOptions.framesPerPacket);
     }
     else {
-        // adjust packet size for the rtp packet header (12).
-        const adjustedMtu = videoOptions.maxPacketSize - 12;
-        h264Packetizer = new H264Repacketizer(console, adjustedMtu, videoOptions);
+        if (videoOptions.maxPacketSize) {
+            // adjust packet size for the rtp packet header (12).
+            const adjustedMtu = videoOptions.maxPacketSize - 12;
+            h264Packetizer = new H264Repacketizer(console, adjustedMtu, videoOptions);
+        }
         sender.setSendBufferSize(1024 * 1024);
     }
 
@@ -106,23 +117,12 @@ export function createCameraStreamSender(console: Console, config: Config, sende
             firstSequenceNumber = rtp.header.sequenceNumber;
         }
 
-        // rough rollover detection to keep packet count accurate.
-        // once within 256 packets of the 0 and 65536, wait for rollover.
-        if (!allowRollover) {
-            if (rtp.header.sequenceNumber > 0xFF00)
-                allowRollover = true;
-        }
-        else if (rtp.header.sequenceNumber < 0x00FF) {
-            allowRollover = false;
-            rolloverCount++;
-        }
-
         if (!firstTimestamp)
             firstTimestamp = rtp.header.timestamp;
 
         if (audioOptions) {
-            rtp = opusPacketizer.repacketize(rtp);
-            if (!rtp)
+            const packets = opusPacketizer.repacketize(rtp);
+            if (!packets)
                 return;
 
             // from HAP spec:
@@ -140,7 +140,14 @@ export function createCameraStreamSender(console: Console, config: Config, sende
             // audio will work so long as the rtp timestamps are created properly: which is a construct of the sample rate
             // HAP requests, and the packet time is respected,
             // opus 48khz will work just fine.
-            rtp.header.timestamp = (firstTimestamp + packetCount * 180 * audioIntervalScale) % 0xFFFFFFFF;
+            for (const rtp of packets) {
+                rtp.header.timestamp = (firstTimestamp + packetCount * 160 * audioIntervalScale) % 0xFFFFFFFF;
+                sendPacket(rtp);
+            }
+            return;
+        }
+
+        if (!h264Packetizer) {
             sendPacket(rtp);
             return;
         }
@@ -151,8 +158,15 @@ export function createCameraStreamSender(console: Console, config: Config, sende
         for (const packet of packets) {
             if (analyzeVideo) {
                 const naluTypes = getNaluTypesInNalu(packet.payload, true);
-                console.log('scanning for idr start found:', ...[...naluTypes]);
                 analyzeVideo = !naluTypes.has(H264_NAL_TYPE_IDR);
+                if (analyzeVideo) {
+                    naluTypes.forEach(loggedNaluTypes.add, loggedNaluTypes);
+                    logIdrCheck();
+                }
+                else {
+                    printNaluTypes();
+                    console.log('idr start found:', ...[...naluTypes]);
+                }
             }
             sendPacket(packet);
         }

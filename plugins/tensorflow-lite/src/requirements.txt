@@ -1,13 +1,6 @@
 --extra-index-url https://google-coral.github.io/py-repo/
-
-# plugin
-numpy>=1.16.2
-Pillow>=5.4.1
-pycairo==1.11.1
-pycoral==2.0.0
-PyGObject>=3.30.4
+# must ensure numpy is pinned to prevent dependencies with an unpinned numpy from pulling numpy>=2.0.
+numpy==1.26.4
+pycoral~=2.0
 tflite-runtime==2.5.0.post1
-
-# SORT tracker
-filterpy==1.4.5
-lap==0.4.0
+Pillow==10.3.0

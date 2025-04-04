@@ -7,14 +7,14 @@ const fs = require('fs');
 let out;
 const cwd = process.cwd();
 
-if (process.env.NODE_ENV == 'production') {
+const isProduction = process.env.NODE_ENV === 'production';
+if (isProduction) {
     out = path.resolve(cwd, 'dist');
 }
 else {
     out = path.resolve(cwd, 'out');
 }
 
-const isProduction = process.env.NODE_ENV == 'production';
 
 function ensureAlias(name) {
     const sanitizedName = name.replace(/@/g, '').replace(/\//g, '').replace(/-/g, '');
@@ -32,7 +32,20 @@ function ensureAlias(name) {
 
 const plugins = [
     new webpack.DefinePlugin({
+        'import.meta': undefined,
+    }),
+    new webpack.DefinePlugin({
         'process.env.SSDP_COV': false,
+    }),
+    new webpack.optimize.LimitChunkCountPlugin({
+        maxChunks: 1,
+    }),
+    new webpack.BannerPlugin({
+        banner: (data) => {
+            return `\n//# sourceURL=/plugin/${path.basename(data.filename)}`;
+        },
+        raw: true,
+        footer: true,
     }),
 ];
 
@@ -46,15 +59,14 @@ if (process.env.WEBPACK_ANALYZER) {
 
 const alias = {};
 const polyfills = [
+    '@scrypted/node-pty',
+    'node-forge',
+    'sharp',
     'source-map-support/register',
     'adm-zip',
     "memfs",
     "realfs",
     "fakefs",
-    // remove this at some point
-    // 1/21/2022
-    'wrtc',
-    '@koush/wrtc',
     "mdns",
     "typescript",
 ];
@@ -78,19 +90,28 @@ module.exports = {
     },
     module: {
         rules: [
-            {
-                test: /\.(ts|js)x?$/,
-                exclude: /(core-js)/,
-                use: {
-                    loader: 'babel-loader',
-                    options: {
-                        "presets": [
-                            "@babel/preset-typescript",
-                        ]
+            // {
+            //     test: /\.(js)x?$/,
+            //     loader: 'babel-loader',
+            // },
+            process.env.SCRYPTED_WEBPACK_BABEL ?
+                {
+                    test: /\.(ts|js)x?$/,
+                    exclude: /(core-js)/,
+                    use: {
+                        loader: 'babel-loader',
+                        options: {
+                            "presets": [
+                                "@babel/preset-typescript",
+                            ]
+                        }
                     }
-                }
-            },
-        ]
+                } :
+                {
+                    test: /\.([cm]?ts|tsx)$/,
+                    loader: "ts-loader",
+                },
+        ],
     },
 
     node: {
@@ -116,9 +137,17 @@ module.exports = {
     optimization: {
         minimize: isProduction,
         minimizer: [
-            new TerserPlugin(),
+            new TerserPlugin(
+                {
+                    terserOptions: {
+                        compress: {
+                            typeofs: false,
+                        }
+                    }
+                },
+            ),
         ],
     },
 
-    devtool: 'source-map',
+    devtool: process.env.WEBPACK_DEVTOOL || 'source-map',
 };

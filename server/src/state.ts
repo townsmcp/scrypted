@@ -1,9 +1,9 @@
-import { EventDetails, EventListenerOptions, EventListenerRegister, Refresh, ScryptedInterface, ScryptedInterfaceProperty, ScryptedNativeId, SystemDeviceState } from "@scrypted/types";
+import { EventDetails, EventListenerOptions, EventListenerRegister, Refresh, ScryptedInterface, ScryptedInterfaceProperty, SystemDeviceState } from "@scrypted/types";
 import throttle from 'lodash/throttle';
 import { PluginDevice } from "./db-types";
-import { EventListenerRegisterImpl, EventRegistry } from "./event-registry";
-import { allInterfaceProperties, propertyInterfaces } from "./plugin/descriptor";
-import { RefreshSymbol } from "./plugin/plugin-device";
+import { EventListenerRegisterImpl, EventRegistry, getMixinEventName } from "./event-registry";
+import { propertyInterfaces } from "./plugin/descriptor";
+import { QueryInterfaceSymbol, RefreshSymbol } from "./plugin/plugin-device";
 import { ScryptedRuntime } from "./runtime";
 import { sleep } from "./sleep";
 
@@ -34,24 +34,82 @@ export class ScryptedStateManager extends EventRegistry {
         this.scrypted = scrypted;
     }
 
-    setPluginState(pluginId: string, nativeId: ScryptedNativeId, eventInterface: ScryptedInterface, property: string, value: any) {
-        const device = this.scrypted.findPluginDevice(pluginId, nativeId);
+    async getImplementerId(pluginDevice: PluginDevice, eventInterface: ScryptedInterface | string) {
+        if (!eventInterface)
+            throw new Error(`ScryptedInterface is required`);
+
+        const device = this.scrypted.getDevice(pluginDevice._id);
         if (!device)
-            throw new Error(`device not found for plugin id ${pluginId} native id ${nativeId}`);
-        this.setPluginDeviceState(device, property, value, eventInterface);
+            throw new Error(`device ${pluginDevice._id} not found?`);
+
+        const implementerId: string = await (device as any)[QueryInterfaceSymbol](eventInterface);
+        return implementerId;
+    }
+
+    async notifyInterfaceEventFromMixin(pluginDevice: PluginDevice, eventInterface: ScryptedInterface | string, value: any, mixinId: string) {
+        // TODO: figure out how to clean this up this hack. For now,
+        // Settings interface is allowed to bubble from mixin devices..
+
+        // TODO: mixin masking of property-less events is disabled due to ObjectDetector.
+        // Running opencv and tensorflow-lite masks one or the other object events.
+        // Need to think this through more.
+        if (false && eventInterface !== ScryptedInterface.Settings) {
+            const implementerId = await this.getImplementerId(pluginDevice, eventInterface);
+            if (implementerId !== mixinId) {
+                const event = getMixinEventName({
+                    event: eventInterface,
+                    mixinId,
+                });
+
+                this.notifyEventDetails(pluginDevice._id, {
+                    eventId: undefined,
+                    eventInterface,
+                    eventTime: Date.now(),
+                    mixinId,
+                }, value, event);
+
+                return;
+            }
+        }
+
+        this.notify(pluginDevice?._id, Date.now(), eventInterface, undefined, value);
+    }
+
+    async setPluginDeviceStateFromMixin(pluginDevice: PluginDevice, property: string, value: any, eventInterface: ScryptedInterface, mixinId: string) {
+        // TODO: crashing here. send descriptor from python too.
+        eventInterface = eventInterface || propertyInterfaces[property];
+
+        const implementerId = await this.getImplementerId(pluginDevice, eventInterface);
+        if (implementerId !== mixinId) {
+            const event = getMixinEventName({
+                event: eventInterface,
+                mixinId,
+            });
+            this.scrypted.getDeviceLogger(pluginDevice).log('i', `${property}: ${value} (mixin)`);
+            this.notifyEventDetails(pluginDevice._id, {
+                eventId: undefined,
+                eventInterface,
+                eventTime: Date.now(),
+                mixinId,
+                property,
+            }, value, event);
+            return false;
+        }
+
+        return this.setPluginDeviceState(pluginDevice, property, value, eventInterface);
     }
 
     setPluginDeviceState(device: PluginDevice, property: string, value: any, eventInterface?: ScryptedInterface) {
         eventInterface = eventInterface || propertyInterfaces[property];
         if (!eventInterface)
-            throw new Error(`${property} is not a valid property`);
+            throw new Error(`eventInterface must be provided`);
 
         const changed = setState(device, property, value);
 
-        const eventTime = device?.state?.[property]?.lastEventTime;
-
-        if (this.notify(device?._id, eventTime, eventInterface, property, value, changed) && device) {
-            this.scrypted.getDeviceLogger(device).log('i', `state change: ${property} ${value}`);
+        if (eventInterface !== ScryptedInterface.ScryptedDevice) {
+            if (this.notify(device?._id, Date.now(), eventInterface, property, value, { changed }) && device) {
+                this.scrypted.getDeviceLogger(device).log('i', `${property}: ${value}`);
+            }
         }
 
         this.upserts.add(device._id);
@@ -61,15 +119,18 @@ export class ScryptedStateManager extends EventRegistry {
     }
 
     updateDescriptor(device: PluginDevice) {
-        this.notify(device._id, undefined, ScryptedInterface.ScryptedDevice, undefined, device.state, true);
+        this.notify(device._id, undefined, ScryptedInterface.ScryptedDevice, undefined, device.state, { changed: true });
     }
 
     removeDevice(id: string) {
-        this.notify(undefined, undefined, ScryptedInterface.ScryptedDevice, ScryptedInterfaceProperty.id, id, true);
+        this.notify(undefined, undefined, ScryptedInterface.ScryptedDevice, ScryptedInterfaceProperty.id, id, { changed: true });
     }
 
-    notifyInterfaceEvent(device: PluginDevice, eventInterface: ScryptedInterface | string, value: any) {
-        this.notify(device?._id, Date.now(), eventInterface, undefined, value, true);
+    notifyInterfaceEvent(device: PluginDevice, eventInterface: ScryptedInterface | string, value: any, mixinId?: string) {
+        this.notify(device?._id, Date.now(), eventInterface, undefined, value, {
+            changed: true,
+            mixinId,
+        });
     }
 
     setState(id: string, property: string, value: any) {
@@ -116,7 +177,7 @@ export class ScryptedStateManager extends EventRegistry {
         let cb = (eventDetails: EventDetails, eventData: any) => {
             if (denoise && lastData === eventData)
                 return;
-            callback(eventDetails, eventData);
+            callback?.(eventDetails, eventData);
         };
 
         const wrappedRegister = super.listenDevice(id, options, cb);
@@ -124,6 +185,7 @@ export class ScryptedStateManager extends EventRegistry {
         return new EventListenerRegisterImpl(() => {
             wrappedRegister.removeListener();
             cb = undefined;
+            callback = undefined;
             polling = false;
         });
     }
@@ -205,15 +267,14 @@ function isSameValue(value1: any, value2: any) {
 }
 
 export function setState(pluginDevice: PluginDevice, property: string, value: any): boolean {
+    // device may have been deleted.
+    if (!pluginDevice.state)
+        return;
     if (!pluginDevice.state[property])
         pluginDevice.state[property] = {};
     const state = pluginDevice.state[property];
-    const now = Date.now();
     const changed = !isSameValue(value, state.value);
-    if (changed)
-        state.stateTime = now;
     state.value = value;
-    state.lastEventTime = now;
     return changed;
 }
 

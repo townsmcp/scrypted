@@ -1,40 +1,12 @@
-import { MixinDeviceBase, ScryptedDeviceBase, ScryptedDeviceType } from '@scrypted/sdk';
-import { randomBytes } from 'crypto';
-import { Categories, EventedHTTPServer, HAPStorage } from './hap';
-import './types';
-import os from 'os';
-import { StorageSettingsDict } from '@scrypted/common/src/settings';
-import crypto from 'crypto';
 import { closeQuiet, createBindZero } from '@scrypted/common/src/listen-cluster';
+import sdk, { ScryptedDeviceType } from '@scrypted/sdk';
+import { StorageSettingsDict } from "@scrypted/sdk/storage-settings";
+import crypto, { randomBytes } from 'crypto';
 import { once } from 'events';
-
-class HAPLocalStorage {
-    initSync() {
-
-    }
-    getItem(key: string): any {
-        const data = localStorage.getItem(key);
-        if (!data)
-            return;
-        return JSON.parse(data);
-    }
-    setItemSync(key: string, value: any) {
-        localStorage.setItem(key, JSON.stringify(value));
-    }
-    removeItemSync(key: string) {
-        localStorage.removeItem(key);
-    }
-
-    persistSync() {
-
-    }
-}
-
-// HAP storage seems to be global?
-export function initializeHapStorage() {
-    HAPStorage.setStorage(new HAPLocalStorage());
-}
-
+import os from 'os';
+import { Categories, EventedHTTPServer, HAPStorage } from './hap';
+import { randomPinCode } from './pincode';
+import './types';
 
 export function createHAPUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
@@ -52,7 +24,7 @@ export function getHAPUUID(storage: Storage) {
     return uuid;
 }
 
-export function typeToCategory(type: ScryptedDeviceType): Categories {
+export function typeToCategory(type: ScryptedDeviceType | string): Categories {
     switch (type) {
         case ScryptedDeviceType.Camera:
             return Categories.CAMERA;
@@ -76,6 +48,8 @@ export function typeToCategory(type: ScryptedDeviceType): Categories {
             return Categories.SENSOR;
         case ScryptedDeviceType.Switch:
             return Categories.SWITCH;
+        case ScryptedDeviceType.Siren:
+            return Categories.SWITCH;
         case ScryptedDeviceType.Thermostat:
             return Categories.THERMOSTAT;
         case ScryptedDeviceType.Vacuum:
@@ -92,7 +66,7 @@ export function createHAPUsername() {
 }
 
 export function getAddresses() {
-    const addresses = Object.entries(os.networkInterfaces()).filter(([iface]) => iface.startsWith('en') || iface.startsWith('eth') || iface.startsWith('wlan')).map(([_, addr]) => addr).flat().map(info => info.address).filter(address => address);
+    const addresses = Object.entries(os.networkInterfaces()).filter(([iface]) => iface.startsWith('en') || iface.startsWith('eth') || iface.startsWith('wlan') || iface.startsWith('net')).map(([_, addr]) => addr).flat().map(info => info.address).filter(address => address);
     return addresses;
 }
 
@@ -100,25 +74,63 @@ export function getRandomPort() {
     return Math.round(30000 + Math.random() * 20000);
 }
 
-export function createHAPUsernameStorageSettingsDict(group?: string): StorageSettingsDict<'mac' | 'qrCode' | 'pincode'> {
+export function createHAPUsernameStorageSettingsDict(device: { storage: Storage, name?: string }, group: string, subgroup?: string): StorageSettingsDict<'mac' | 'addIdentifyingMaterial' | 'qrCode' | 'pincode' | 'portOverride' | 'resetAccessory'> {
+    const alertReload = () => {
+        sdk.log.a(`The HomeKit plugin will reload momentarily for the changes to ${device.name} to take effect.`);
+        sdk.deviceManager.requestRestart();
+    }
+
     return {
+        addIdentifyingMaterial: {
+            hide: true,
+            type: 'boolean',
+        },
         qrCode: {
             group,
+            // subgroup,
             title: "Pairing QR Code",
-            type: 'qrcode',
+            type: 'html',
             readonly: true,
             description: "Scan with your iOS camera to pair this Scrypted with HomeKit.",
         },
+        portOverride: {
+            group,
+            subgroup,
+            title: 'Bridge Port',
+            persistedDefaultValue: getRandomPort(),
+            description: 'Optional: The TCP port used by the Scrypted bridge. If none is specified, a random port will be chosen.',
+            type: 'number',
+        },
         pincode: {
             group,
+            // subgroup,
             title: "Manual Pairing Code",
+            persistedDefaultValue: randomPinCode(),
             readonly: true,
         },
         mac: {
             group,
+            subgroup,
             hide: true,
             title: "Username Override",
             persistedDefaultValue: createHAPUsername(),
+        },
+        resetAccessory: {
+            group,
+            subgroup,
+            title: 'Reset Pairing',
+            description: 'Resetting the pairing will resync it to HomeKit as a new device. Bridged devices will automatically relink as a new device. Accessory devices must be manually removed from the Home app and re-paired. Enter RESET to reset the pairing.',
+            placeholder: 'RESET',
+            mapPut: (oldValue, newValue) => {
+                if (newValue === 'RESET') {
+                    device.storage.removeItem('mac');
+                    alertReload();
+                    // generate a new reset accessory random value.
+                    return crypto.randomBytes(8).toString('hex');
+                }
+                throw new Error('HomeKit Accessory Reset cancelled.');
+            },
+            mapGet: () => '',
         },
     }
 }

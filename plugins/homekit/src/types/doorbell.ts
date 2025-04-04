@@ -1,8 +1,9 @@
-import { BinarySensor, ScryptedDevice, ScryptedDeviceType, ScryptedInterface } from '@scrypted/sdk';
+import sdk, { BinarySensor, ScryptedDevice, ScryptedDeviceType, ScryptedInterface } from '@scrypted/sdk';
 import { addSupportedType, DummyDevice, supportedTypes } from '../common';
 import { Characteristic, CharacteristicEventTypes, Service, StatelessProgrammableSwitch } from '../hap';
 import { makeAccessory } from './common';
 import type { HomeKitPlugin } from "../main";
+import { createCameraStorageSettings } from '../camera-mixin';
 
 addSupportedType({
     type: ScryptedDeviceType.Doorbell,
@@ -20,13 +21,18 @@ addSupportedType({
 
         const service = accessory.addService(Service.Doorbell);
 
-        const stateless = new StatelessProgrammableSwitch(device.name, undefined);
-        stateless.getCharacteristic(Characteristic.ProgrammableSwitchEvent)
-            .setProps({
-                maxValue: Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
-            });
+        const storage = sdk.deviceManager.getMixinStorage(device.id, homekitPlugin.nativeId);
+        const cameraStorage = createCameraStorageSettings({ storage, onDeviceEvent: undefined });
 
-        accessory.addService(stateless);
+        const stateless = cameraStorage.values.doorbellAutomationButton ? new StatelessProgrammableSwitch(device.name, undefined) : undefined;
+        if (stateless) {
+            stateless.getCharacteristic(Characteristic.ProgrammableSwitchEvent)
+                .setProps({
+                    maxValue: Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
+                });
+
+            accessory.addService(stateless);
+        }
 
         device.listen({
             event: ScryptedInterface.BinarySensor,
@@ -34,7 +40,7 @@ addSupportedType({
         }, () => {
             if (device.binaryState) {
                 service.updateCharacteristic(Characteristic.ProgrammableSwitchEvent, Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
-                stateless.updateCharacteristic(Characteristic.ProgrammableSwitchEvent, Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
+                stateless?.updateCharacteristic(Characteristic.ProgrammableSwitchEvent, Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
             }
         });
 

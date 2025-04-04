@@ -1,80 +1,114 @@
 import { HttpResponse, HttpResponseOptions } from "@scrypted/types";
 import { Response } from "express";
-import { RpcPeer } from "./rpc";
-import { join as pathJoin } from 'path';
 import fs from 'fs';
 import net from 'net';
+import { join as pathJoin } from 'path';
+import { RpcPeer } from "./rpc";
+import { setupCluster } from "./cluster/cluster-setup";
+import type { ScryptedRuntime } from "./runtime";
 
-const mime = require('mime/lite');
+export class HttpResponseImpl implements HttpResponse {
+    constructor(public scrypted: ScryptedRuntime, public res: Response, public unzippedDir: string, public filesPath: string) {
+        res.on('error', e => {
+            console.warn("Error while sending response from plugin", e);
+        });
+    }
 
-export function createResponseInterface(res: Response, unzippedDir: string, filesPath: string): HttpResponse {
-    class HttpResponseImpl implements HttpResponse {
-        [RpcPeer.PROPERTY_PROXY_ONEWAY_METHODS] = [
-            'send',
-            'sendFile',
-            'sendSocket',
-        ];
+    [RpcPeer.PROPERTY_PROXY_ONEWAY_METHODS] = [
+        'send',
+        'sendFile',
+        'sendSocket',
+        'sendStream',
+    ];
+    sent = false;
 
-        send(body: string): void;
-        send(body: string, options: HttpResponseOptions): void;
-        send(body: Buffer): void;
-        send(body: Buffer, options: HttpResponseOptions): void;
-        send(body: any, options?: any) {
-            if (options?.code)
-                res.status(options.code);
-            if (options?.headers) {
-                for (const header of Object.keys(options.headers)) {
-                    res.setHeader(header, (options.headers as any)[header]);
-                }
-            }
-
-            res.send(body);
-        }
-
-        sendFile(path: string): void;
-        sendFile(path: string, options: HttpResponseOptions): void;
-        sendFile(path: any, options?: HttpResponseOptions) {
-            if (options?.code)
-                res.status(options.code);
-            if (options?.headers) {
-                for (const header of Object.keys(options.headers)) {
-                    res.setHeader(header, (options.headers as any)[header]);
-                }
-            }
-
-            if (!res.getHeader('Content-Type')) {
-                const type = mime.getType(path);
-                if (type) {
-                    res.contentType(mime.getExtension(type));
-                }
-            }
-
-            let filePath = pathJoin(unzippedDir, 'fs', path);
-            if (!fs.existsSync(filePath)) {
-                filePath = pathJoin(filesPath, path);
-                if (!fs.existsSync(filePath)) {
-                    filePath = path;
-                    if (!fs.existsSync(filePath)) {
-                        res.status(404);
-                        res.end();
-                        return;
-                    }
-                }
-            }
-            res.sendFile(filePath);
-        }
-
-        sendSocket(socket: net.Socket, options: HttpResponseOptions) {
-            if (options?.code)
-                res.status(options.code);
-            if (options?.headers) {
-                for (const header of Object.keys(options.headers)) {
-                    res.setHeader(header, (options.headers as any)[header]);
-                }
-            }
-            socket.pipe(res);
+    #setHeaders(options?: HttpResponseOptions) {
+        if (!options?.headers)
+            return;
+        for (const header of Object.keys(options.headers)) {
+            const val = (options.headers as any)[header];
+            // null-ish headers will cause something to fail downstream.
+            if (val != null)
+                this.res.setHeader(header, val);
         }
     }
 
-    return new HttpResponseImpl();
+    send(body: string | Buffer, options?: any) {
+        this.sent = true;
+        if (options?.code)
+            this.res.status(options.code);
+        this.#setHeaders(options);
+
+        this.res.send(body);
+    }
+
+    sendFile(path: string, options?: HttpResponseOptions) {
+        this.sent = true;
+        if (options?.code)
+            this.res.status(options.code);
+        this.#setHeaders(options);
+
+        let filePath = pathJoin(this.unzippedDir, 'fs', path);
+        if (!fs.existsSync(filePath)) {
+            filePath = pathJoin(this.filesPath, path);
+            if (!fs.existsSync(filePath)) {
+                filePath = path;
+                if (!fs.existsSync(filePath)) {
+                    this.res.status(404);
+                    this.res.end();
+                    return;
+                }
+            }
+        }
+
+        // prefer etag
+        this.res.sendFile(filePath, {
+            cacheControl: false,
+        });
+    }
+
+    sendSocket(socket: net.Socket, options: HttpResponseOptions) {
+        this.sent = true;
+        if (options?.code)
+            this.res.status(options.code);
+        this.#setHeaders(options);
+        socket.pipe(this.res);
+    }
+
+    sendStream(stream: AsyncGenerator<Buffer, void>, options?: HttpResponseOptions): void {
+        this.sent = true;
+        if (options?.code)
+            this.res.status(options.code);
+        this.#setHeaders(options);
+        const peer = new RpcPeer("server-stream", "client-stream", (message, reject, serializationContext) => {
+            console.warn('unexpected message to client-stream', message);
+        });
+        const clusterSetup = setupCluster(peer);
+
+        (async () => {
+            try {
+                await clusterSetup.initializeCluster({
+                    clusterId: this.scrypted.clusterId,
+                    clusterWorkerId: this.scrypted.serverClusterWorkerId,
+                    clusterSecret: this.scrypted.clusterSecret,
+                });
+                stream = await clusterSetup.connectRPCObject(stream);
+
+                for await (const chunk of stream) {
+                    this.res.write(chunk);
+                }
+                this.res.end();
+            }
+            catch (e) {
+                this.res.destroy(e);
+            }
+            finally {
+                peer.kill();
+            }
+        })();
+    }
+}
+
+export function createResponseInterface(scrypted: ScryptedRuntime, res: Response, unzippedDir: string, filesPath: string): HttpResponseImpl {
+    return new HttpResponseImpl(scrypted, res, unzippedDir, filesPath);
 }

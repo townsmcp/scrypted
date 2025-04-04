@@ -5,14 +5,16 @@
       "scrypted-setup-project": "scrypted-setup-project",
       "prescrypted-setup-project": "scrypted-package-json",
       "build": "scrypted-webpack",
+      "preprepublishOnly": "scrypted-changelog",
       "prepublishOnly": "NODE_ENV=production scrypted-webpack",
       "prescrypted-vscode-launch": "scrypted-webpack",
       "scrypted-vscode-launch": "scrypted-deploy-debug",
       "scrypted-deploy-debug": "scrypted-deploy-debug",
       "scrypted-debug": "scrypted-debug",
       "scrypted-deploy": "scrypted-deploy",
-      "scrypted-readme": "scrypted-readme",
-      "scrypted-package-json": "scrypted-package-json"
+      "scrypted-changelog": "scrypted-changelog",
+      "scrypted-package-json": "scrypted-package-json",
+      "scrypted-readme": "scrypted-readme"
    },
    "keywords": [
       "scrypted",
@@ -25,26 +27,30 @@
    "scrypted": {
       "name": "Scrypted Cloud",
       "type": "API",
+      "realfs": true,
       "interfaces": [
-         "BufferConverter",
+         "SystemSettings",
+         "MediaConverter",
          "OauthClient",
          "Settings",
-         "DeviceProvider",
          "HttpRequestHandler"
       ]
    },
    "dependencies": {
-      "axios": "^0.25.0",
-      "bpmux": "^8.1.3",
-      "debug": "^4.3.1",
+      "@eneris/push-receiver": "^4.3.0",
+      "@scrypted/common": "file:../../common",
+      "@scrypted/sdk": "file:../../sdk",
+      "bpmux": "^8.2.1",
+      "cloudflared": "^0.5.3",
+      "exponential-backoff": "^3.1.1",
       "http-proxy": "^1.18.1",
-      "push-receiver": "^2.1.1",
-      "query-string": "^6.14.1"
+      "nat-upnp": "file:./external/node-nat-upnp"
    },
    "devDependencies": {
-      "@scrypted/sdk": "file:../../sdk",
-      "@types/debug": "^4.1.5",
-      "@types/http-proxy": "^1.17.5"
+      "@types/http-proxy": "^1.17.15",
+      "@types/nat-upnp": "^1.1.5",
+      "@types/node": "^22.10.1",
+      "ts-node": "^10.9.2"
    },
-   "version": "0.0.33"
+   "version": "0.2.49"
 }

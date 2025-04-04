@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/snapshot",
-   "version": "0.0.30",
+   "version": "0.2.58",
    "description": "Snapshot Plugin for Scrypted",
    "scripts": {
       "scrypted-setup-project": "scrypted-setup-project",
@@ -22,22 +22,25 @@
       "camera"
    ],
    "scrypted": {
+      "realfs": true,
       "name": "Snapshot Plugin",
       "type": "API",
       "interfaces": [
-         "MixinProvider"
+         "Settings",
+         "MixinProvider",
+         "BufferConverter",
+         "DeviceProvider",
+         "HttpRequestHandler"
       ]
    },
-   "optionalDependencies": {
-      "jimp": "^0.16.1"
-   },
    "dependencies": {
-      "@koush/axios-digest-auth": "^0.8.5",
-      "@types/node": "^16.6.1",
-      "axios": "^0.24.0"
+      "@types/node": "^22.10.2",
+      "sharp": "^0.33.5",
+      "whatwg-mimetype": "^4.0.0"
    },
    "devDependencies": {
       "@scrypted/common": "file:../../common",
-      "@scrypted/sdk": "file:../../sdk"
+      "@scrypted/sdk": "file:../../sdk",
+      "@types/whatwg-mimetype": "^3.0.2"
    }
 }

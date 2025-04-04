@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/onvif",
-   "version": "0.0.91",
+   "version": "0.1.31",
    "description": "ONVIF Camera Plugin for Scrypted",
    "author": "Scrypted",
    "license": "Apache",
@@ -27,7 +27,8 @@
       "name": "ONVIF Camera Plugin",
       "type": "DeviceProvider",
       "interfaces": [
-         "Settings",
+         "ScryptedSystemDevice",
+         "ScryptedDeviceCreator",
          "DeviceProvider",
          "DeviceCreator",
          "DeviceDiscovery"
@@ -37,19 +38,16 @@
       ]
    },
    "dependencies": {
-      "@koush/axios-digest-auth": "^0.8.5",
       "@scrypted/common": "file:../../common",
       "@scrypted/sdk": "file:../../sdk",
-      "@types/node": "^16.9.1",
       "base-64": "^1.0.0",
-      "http-auth-utils": "^3.0.2",
       "md5": "^2.3.0",
-      "onvif": "file:../../external/onvif",
-      "xml2js": "file:../../external/onvif/node_modules/xml2js",
-      "syno": "^2.2.0"
+      "onvif": "^0.7.4",
+      "xml2js": "^0.6.2"
    },
    "devDependencies": {
-      "@types/md5": "^2.3.1",
-      "@types/xml2js": "^0.4.9"
+      "@types/md5": "^2.3.5",
+      "@types/node": "^20.11.0",
+      "@types/xml2js": "^0.4.14"
    }
 }

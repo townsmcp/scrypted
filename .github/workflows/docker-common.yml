@@ -1,53 +1,148 @@
-name: Publish Scrypted Base OS
+name: Publish Scrypted Common
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
-  schedule:
-    # publish the common base once a month.
-    - cron:  '30 8 2 * *'
 
 jobs:
-  push_to_registry:
+  build:
     name: Push Docker image to Docker Hub
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    env:
+      NODE_VERSION: '20'
     strategy:
       matrix:
-        node: ["16-bullseye", "18-bullseye"]
+        BASE: ["noble"]
+        FLAVOR: ["full", "lite"]
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-        
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+              platforms: linux/amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/arm64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+              platforms: linux/arm64
+
       - name: Login to Docker Hub
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login to Github Container Registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image (scrypted-common)
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v4
         with:
-          build-args: BASE=${{ matrix.node }}
-          context: .
-          file: docker/Dockerfile.common
-          platforms: linux/amd64,linux/arm64,linux/armhf
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            BASE=${{ matrix.BASE }}
+          context: install/docker/
+          file: install/docker/Dockerfile.${{ matrix.FLAVOR }}
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            koush/scrypted-common:${{ matrix.node }}
-            ${{ matrix.node == '16-bullseye' && 'koush/scrypted-common:latest' || '' }}
+            koush/scrypted-common:${{ matrix.BASE }}-${{ matrix.FLAVOR }}
+            ghcr.io/koush/scrypted-common:${{ matrix.BASE }}-${{ matrix.FLAVOR }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-nvidia:
+    name: Push NVIDIA Docker image to Docker Hub
+    needs: build
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        BASE: ["noble"]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+              platforms: linux/amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/arm64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+              platforms: linux/arm64
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to Github Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image (scrypted-common)
+        uses: docker/build-push-action@v4
+        with:
+          build-args: |
+            BASE=ghcr.io/koush/scrypted-common:${{ matrix.BASE }}-full
+          context: install/docker/
+          file: install/docker/Dockerfile.nvidia
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            koush/scrypted-common:${{ matrix.BASE }}-nvidia
+            ghcr.io/koush/scrypted-common:${{ matrix.BASE }}-nvidia
           cache-from: type=gha
           cache-to: type=gha,mode=max

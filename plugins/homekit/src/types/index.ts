@@ -9,6 +9,10 @@ import './mediaplayer';
 import './security';
 import './sensor';
 import './switch';
+import './siren';
 import './thermostat';
 import './vacuum';
-
+import './outlet';
+import './notifier';
+import './windowcovering'
+import './airpurifier'

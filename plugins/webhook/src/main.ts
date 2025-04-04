@@ -1,4 +1,4 @@
-import { HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, PushHandler, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptors, Setting, Settings, SettingValue } from '@scrypted/sdk';
+import { HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, PushHandler, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptors, Setting, Settings, SettingValue, WritableDeviceState } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { SettingsMixinDeviceBase } from "../../../common/src/settings-mixin";
 import { randomBytes } from 'crypto';
@@ -103,27 +103,36 @@ class WebhookMixin extends SettingsMixinDeviceBase<Settings> {
         }
         const methodOrProperty = pathSegments[3];
         if (allInterfaceMethods.includes(methodOrProperty)) {
-            const query = new URLSearchParams(request.url.split('?')[1] || '');
-            let parameters = [];
-            const p = query.get('parameters');
-            if (p) {
-                parameters = JSON.parse(p);
-            }
-
             try {
+                const query = new URLSearchParams(request.url.split('?')[1] || '');
+                let parameters = [];
+                const p = query.get('parameters');
+                if (p) {
+                    parameters = JSON.parse(p);
+                }
+
                 const result = await device[methodOrProperty](...parameters);
-                this.maybeSendMediaObject(response, result, methodOrProperty);
+                if (request.headers['accept']?.includes('application/json')) {
+                    response?.send(JSON.stringify({ result }), {
+                        headers: {
+                            'Content-Type': 'application/json',
+                        }
+                    });
+                }
+                else {
+                    await this.maybeSendMediaObject(response, result, methodOrProperty);
+                }
             }
             catch (e) {
                 this.console.error('webhook action error', e);
                 response.send('Internal Error', {
                     code: 500,
-                })
+                });
             }
         }
         else if (allInterfaceProperties.includes(methodOrProperty)) {
             const value = device[methodOrProperty];
-            if (request.headers['accept'] && request.headers['accept'].indexOf('application/json') !== -1) {
+            if (request.headers['accept']?.includes('application/json')) {
                 response?.send(JSON.stringify({ value }), {
                     headers: {
                         'Content-Type': 'application/json',
@@ -131,14 +140,14 @@ class WebhookMixin extends SettingsMixinDeviceBase<Settings> {
                 });
             }
             else {
-                response?.send(value.toString());
+                response?.send(value?.toString());
             }
         }
         else {
             this.console.error('Unknown method or property', methodOrProperty);
             response.send('Not Found', {
                 code: 404,
-            })
+            });
         }
     }
 }
@@ -154,6 +163,13 @@ class WebhookPlugin extends ScryptedDeviceBase implements Settings, MixinProvide
         const id = pathSegments[1];
 
         const device = systemManager.getDeviceById<ScryptedDevice & Settings>(id);
+        if (!device) {
+            this.console.error('no such device');
+            response.send('Not Found', {
+                code: 404,
+            })
+            return;
+        }
         this.console.log('device', id, device.name);
 
         if (!device.mixins.includes(this.id)) {
@@ -168,7 +184,13 @@ class WebhookPlugin extends ScryptedDeviceBase implements Settings, MixinProvide
             await device.getSettings();
         }
         const mixin = this.createdMixins.get(id);
-        mixin.handle(request, response, device, pathSegments);
+        if (!mixin) {
+            response.send('Not Found', {
+                code: 404,
+            });
+            return;
+        }
+        await mixin.handle(request, response, device, pathSegments);
     }
 
     onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
@@ -196,7 +218,7 @@ class WebhookPlugin extends ScryptedDeviceBase implements Settings, MixinProvide
         ];
     }
 
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any; }): Promise<any> {
+    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any> {
         const ret = new WebhookMixin({
             mixinDevice,
             mixinDeviceState,
@@ -211,7 +233,9 @@ class WebhookPlugin extends ScryptedDeviceBase implements Settings, MixinProvide
     }
 
     async releaseMixin(id: string, mixinDevice: any): Promise<void> {
-        this.createdMixins.delete(id);
+        if (this.createdMixins.get(id) === mixinDevice) {
+            this.createdMixins.delete(id);
+        }
     }
 }
 

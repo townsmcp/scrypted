@@ -1,12 +1,19 @@
-import net from 'net';
+import dgram, { SocketType } from 'dgram';
 import { once } from 'events';
-import dgram from 'dgram';
+import net from 'net';
 
 export async function closeQuiet(socket: dgram.Socket | net.Server) {
     if (!socket)
         return;
     try {
-        await new Promise(resolve => socket.close(resolve));
+        await new Promise((r, f) => {
+            try {
+                socket.close(r);
+            }
+            catch (e) {
+                f(e);
+            }
+        });
     }
     catch (e) {
     }
@@ -26,12 +33,35 @@ export async function bindZero(server: dgram.Socket) {
     return bindUdp(server, 0);
 }
 
-export async function createBindZero() {
-    return createBindUdp(0);
+export async function createBindZero(socketType?: SocketType) {
+    return createBindUdp(0, socketType);
 }
 
-export async function createBindUdp(usePort: number) {
-    const server = dgram.createSocket('udp4');
+export async function createSquentialBindZero(socketType?: SocketType) {
+    let attempts = 0;
+    while (true) {
+        const rtpServer = await createBindZero(socketType);
+        try {
+            const rtcpServer = await createBindUdp(rtpServer.port + 1, socketType);
+            return [rtpServer, rtcpServer];
+        }
+        catch (e) {
+            attempts++;
+            closeQuiet(rtpServer.server);
+        }
+        if (attempts === 10)
+            throw new Error('unable to reserve sequential udp ports')
+    }
+}
+
+export async function reserveUdpPort() {
+    const udp = await createBindZero();
+    await new Promise(resolve => udp.server.close(() => resolve(undefined)));
+    return udp.port;
+}
+
+export async function createBindUdp(usePort: number, socketType?: SocketType) {
+    const server = dgram.createSocket(socketType || 'udp4');
     const { port, url } = await bindUdp(server, usePort);
     return {
         server,
@@ -49,4 +79,4 @@ export async function bind(server: dgram.Socket, port: number) {
     }
 }
 
-export { listenZero, listenZeroSingleClient } from "@scrypted/server/src/listen-zero";
+export { ListenZeroSingleClientTimeoutError, listenZero, listenZeroSingleClient } from "../../server/src/listen-zero";

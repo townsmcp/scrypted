@@ -1,10 +1,22 @@
 import { ScryptedInterfaceProperty, ScryptedNativeId } from "@scrypted/types";
-import { ScryptedRuntime } from "../runtime";
-import { Plugin } from '../db-types';
-import { getState } from "../state";
-import axios from 'axios';
 import semver from 'semver';
+import { Plugin } from '../db-types';
+import { httpFetch } from "../fetch/http-fetch";
+import { hasMixinCycle } from "../mixin/mixin-cycle";
+import { ScryptedRuntime } from "../runtime";
 import { sleep } from "../sleep";
+import { getState } from "../state";
+
+
+export async function getNpmPackageInfo(pkg: string) {
+    const { body } = await httpFetch({
+        url: `https://registry.npmjs.org/${pkg}`,
+        // force ipv4 in case of busted ipv6.
+        family: 4,
+        responseType: 'json',
+    });
+    return body;
+}
 
 export class PluginComponent {
     scrypted: ScryptedRuntime;
@@ -28,23 +40,27 @@ export class PluginComponent {
         await this.reload(pluginDevice.pluginId);
     }
 
-    getNativeId(id: string) {
-        return this.scrypted.findPluginDeviceById(id)?.nativeId;
-    }
     getStorage(id: string) {
         return this.scrypted.findPluginDeviceById(id)?.storage || {};
     }
+
     async setStorage(id: string, storage: { [key: string]: string }) {
         const pluginDevice = this.scrypted.findPluginDeviceById(id);
         pluginDevice.storage = storage;
         await this.scrypted.datastore.upsert(pluginDevice);
         const host = this.scrypted.getPluginHostForDeviceId(id);
         await host?.remote?.setNativeId?.(pluginDevice.nativeId, pluginDevice._id, storage);
-        this.scrypted.stateManager.notifyInterfaceEvent(pluginDevice, 'Storage', undefined);
     }
     async setMixins(id: string, mixins: string[]) {
+        mixins = mixins || [];
+        if (hasMixinCycle(this.scrypted, id, mixins)) {
+            const message = `setMixins: ${id} has a mixin cycle. Cancelling change.`;
+            console.warn(message);
+            throw new Error(message);
+        }
         const pluginDevice = this.scrypted.findPluginDeviceById(id);
-        this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.mixins, [...new Set(mixins)] || []);
+        this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.mixins, [...new Set(mixins)]);
+        this.scrypted.stateManager.updateDescriptor(pluginDevice);
         await this.scrypted.datastore.upsert(pluginDevice);
         // device may not exist, so force creation.
         this.scrypted.rebuildPluginDeviceMixinTable(id);
@@ -57,14 +73,6 @@ export class PluginComponent {
     async getIdForNativeId(pluginId: string, nativeId: ScryptedNativeId) {
         return this.scrypted.findPluginDevice(pluginId, nativeId)?._id;
     }
-    /**
-     * @deprecated available as device.pluginId now.
-     * Remove at some point after core/ui rolls out 6/20/2022.
-     */
-    async getPluginId(id: string) {
-        const pluginDevice = this.scrypted.findPluginDeviceById(id);
-        return pluginDevice.pluginId;
-    }
     async reload(pluginId: string) {
         const plugin = await this.scrypted.datastore.tryGet(Plugin, pluginId);
         await this.scrypted.runPlugin(plugin);
@@ -72,11 +80,15 @@ export class PluginComponent {
     async kill(pluginId: string) {
         return this.scrypted.plugins[pluginId]?.kill();
     }
+    // TODO: Remove this, ScryptedPlugin exists now.
+    // 12/29/2022
     async getPackageJson(pluginId: string) {
         return this.scrypted.getPackageJson(pluginId);
     }
     async getDeviceInfo(id: string) {
         const pluginDevice = this.scrypted.findPluginDeviceById(id);
+        if (!pluginDevice)
+            throw new Error(`device ${id} does not exist`);
         return {
             mixins: getState(pluginDevice, ScryptedInterfaceProperty.mixins) || [],
             pluginId: pluginDevice.pluginId,
@@ -89,17 +101,34 @@ export class PluginComponent {
         const host = this.scrypted.plugins[pluginId];
         let rpcObjects = 0;
         let pendingResults = 0;
+        const pendingResultMethods: {
+            [method: string]: number,
+        } = {};
         if (host.peer) {
             rpcObjects = host.peer.localProxied.size + Object.keys(host.peer.remoteWeakProxies).length;
             pendingResults = Object.keys(host.peer.pendingResults).length;
+            for (const deferred of Object.values(host.peer.pendingResults)) {
+                pendingResultMethods[deferred.method] = (pendingResultMethods[deferred.method] || 0) + 1;
+            }
         }
         return {
             pid: host?.worker?.pid,
-            stats: host?.stats,
+            clientsCount: host?.io?.clientsCount,
             rpcObjects,
             packageJson,
             pendingResults,
+            pendingResultCounts: pendingResultMethods,
             id: this.scrypted.findPluginDevice(pluginId)._id,
+        }
+    }
+
+    async disconnectClients(pluginId: string) {
+        const host = this.scrypted.plugins[pluginId];
+        if (!host)
+            return;
+        const { clients } = host.io as any;
+        for (const client of Object.values(clients)) {
+            (client as any).close()
         }
     }
 
@@ -108,8 +137,7 @@ export class PluginComponent {
     }
 
     async npmInfo(endpoint: string) {
-        const response = await axios(`https://registry.npmjs.org/${endpoint}`);
-        return response.data;
+        return getNpmPackageInfo(endpoint);
     }
 
     async updatePlugins() {
@@ -144,14 +172,14 @@ export class PluginComponent {
         consoleServer.clear(pluginDevice.nativeId);
     }
 
-    async getRemoteServicePort(pluginId: string, name: string, ...args: any[]): Promise<number> {
+    async getRemoteServicePort(pluginId: string, name: string, ...args: any[]): Promise<[number, string]> {
         if (name === 'console') {
             const consoleServer = await this.scrypted.plugins[pluginId].consoleServer;
-            return consoleServer.readPort;
+            return [consoleServer.readPort, process.env.SCRYPTED_CLUSTER_ADDRESS];
         }
         if (name === 'console-writer') {
             const consoleServer = await this.scrypted.plugins[pluginId].consoleServer;
-            return consoleServer.writePort;
+            return [consoleServer.writePort, process.env.SCRYPTED_CLUSTER_ADDRESS];
         }
 
         return this.scrypted.plugins[pluginId].remote.getServicePort(name, ...args);

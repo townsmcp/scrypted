@@ -42,7 +42,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
     driver: Driver;
     controller: ZWaveController;
     driverReady: Promise<void>;
-    dskDeferred: {reject: any, resolve: any};
+    dskDeferred: { reject: any, resolve: any };
 
     constructor() {
         super();
@@ -92,6 +92,11 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
             this.console.log(process.cwd());
 
             const driver = new Driver(this.storage.getItem('serialPort'), {
+                features: {
+                    softReset: this.storage.getItem('softReset') === 'true',
+                    unresponsiveControllerRecovery: false,
+                    watchdog: false,
+                },
                 securityKeys: {
                     S2_Unauthenticated: Buffer.from(s2UnauthenticatedKey, 'hex'),
                     S2_Authenticated: Buffer.from(s2AuthenticatedKey, 'hex'),
@@ -106,6 +111,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
             console.log(driver.cacheDir);
 
             driver.on("error", (e) => {
+                driver.destroy().catch(() => { });
                 console.error('driver error', e);
                 reject(e);
             });
@@ -155,6 +161,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
                 });
 
                 resolve();
+                log.clearAlerts();
             });
 
             driver.start().catch(reject);
@@ -163,6 +170,8 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
         this.driverReady.catch(e => {
             log.a(`Zwave Driver startup error. Verify the Z-Wave USB stick is plugged in and the Serial Port setting is correct.`);
             this.console.error('zwave driver start error', e);
+            this.console.log('This issue may be due to a driver or database lock. Retrying in 60 seconds.');
+            setTimeout(() => this.startDriver(), 60000);
         });
     }
 
@@ -173,7 +182,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
                 title: 'Inclusion State',
                 key: 'inclusionState',
                 readonly: true,
-                value: InclusionState[this.controller.inclusionState],
+                value: InclusionState[this.controller?.inclusionState],
             },
             {
                 group: 'Inclusion',
@@ -200,7 +209,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
                 title: 'Healing State',
                 key: 'healingState',
                 readonly: true,
-                value: this.controller.isHealNetworkActive ? 'Healing' : 'Not Healing',
+                value: this.controller?.isRebuildingRoutes ? 'Healing' : 'Not Healing',
             },
             {
                 group: 'Network',
@@ -208,6 +217,14 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
                 key: 'heal',
                 type: 'button',
                 description: 'Heal the Z-Wave Network. This operation may take a long time and the network may become unreponsive while in progress.',
+            },
+            {
+                group: 'Adapter',
+                title: 'Soft Reset',
+                key: 'softReset',
+                type: 'boolean',
+                value: this.storage.getItem('softReset') === 'true',
+                description: 'Soft Reset the adapter on startup.',
             },
             {
                 group: 'Adapter',
@@ -249,7 +266,7 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
     }
 
     async stopOperations() {
-        this.controller.stopHealingNetwork();
+        // this.controller.stopHealingNetwork();
         await this.controller.stopExclusion();
         await this.controller.stopInclusion();
     }
@@ -299,34 +316,39 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
 
     async healNetwork() {
         await this.stopOperations();
-        const healing = this.controller.beginHealingNetwork();
+        const healing = this.controller.beginRebuildingRoutes();
         this.console.log('healing network', healing);
     }
 
     async putSetting(key: string, value: string | number | boolean) {
-        if (key === 'inclusion') {
-            this.inclusion();
-            return;
-        }
-        if (key === 'exclusion') {
-            this.exclusion();
-            return;
-        }
-        if (key === 'confirmPin') {
-            this.dskDeferred?.resolve(value.toString());
-            this.dskDeferred = undefined;
-            return;
-        }
-        if (key === 'heal') {
-            this.healNetwork();
-            return;
-        }
+        try {
+            if (key === 'inclusion') {
+                this.inclusion();
+                return;
+            }
+            if (key === 'exclusion') {
+                this.exclusion();
+                return;
+            }
+            if (key === 'confirmPin') {
+                this.dskDeferred?.resolve(value.toString());
+                this.dskDeferred = undefined;
+                return;
+            }
+            if (key === 'heal') {
+                this.healNetwork();
+                return;
+            }
 
-        this.storage.setItem(key, value as string);
+            this.storage.setItem(key, value as string);
 
-        await this.driver?.destroy();
-        this.driver = undefined;
-        this.startDriver();
+            await this.driver?.destroy();
+            this.driver = undefined;
+            this.startDriver();
+        }
+        finally {
+            this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+        }
     }
 
     async discoverDevices(duration: number) {
@@ -335,6 +357,9 @@ export class ZwaveControllerProvider extends ScryptedDeviceBase implements Devic
     async getDevice(nativeId: string) {
         await this.driverReady;
         return this.devices[nativeId];
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
     }
 
     _addType(scryptedDevice: ZwaveDeviceBase, instance: Endpoint, type: CommandClassInfo, valueId: ValueID) {

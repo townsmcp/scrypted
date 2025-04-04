@@ -149,7 +149,7 @@ export function parseFmtp(msection: string[]) {
             const paramLine = fmtpLine.substring(firstSpace + 1);
             const payloadType = parseInt(fmtp.split(':')[1]);
 
-            if (!fmtp || !paramLine || payloadType === NaN) {
+            if (!fmtp || !paramLine || Number.isNaN(payloadType)) {
                 return;
             }
 
@@ -170,27 +170,47 @@ export function parseFmtp(msection: string[]) {
 }
 
 export type MSection = ReturnType<typeof parseMSection>;
+export type RTPMap = ReturnType<typeof parseRtpMap>;
 
-export function parseRtpMap(mlineType: string, rtpmap: string) {
-    const match = rtpmap?.match(/a=rtpmap:([\d]+) (.*?)\/([\d]+)/);
+export function parseRtpMap(mline: ReturnType<typeof parseMLine>, rtpmap: string) {
+    const mlineType = mline.type;
+    const match = rtpmap?.match(/a=rtpmap:([\d]+) (.*?)\/([\d]+)(\/([\d]+))?/);
 
     rtpmap = rtpmap?.toLowerCase();
 
     let codec: string;
+    let ffmpegEncoder: string;
     if (rtpmap?.includes('mpeg4')) {
         codec = 'aac';
+        ffmpegEncoder = 'aac';
     }
     else if (rtpmap?.includes('opus')) {
         codec = 'opus';
+        ffmpegEncoder = 'libopus';
     }
     else if (rtpmap?.includes('pcma')) {
         codec = 'pcm_alaw';
+        ffmpegEncoder = 'pcm_alaw';
     }
     else if (rtpmap?.includes('pcmu')) {
-        codec = 'pcm_ulaw';
+        codec = 'pcm_mulaw';
+        ffmpegEncoder = 'pcm_mulaw';
+    }
+    else if (rtpmap?.includes('g726')) {
+        codec = 'g726';
+        // disabled since it 48000 is non compliant in ffmpeg and fails.
+        // ffmpegEncoder = 'g726';
     }
     else if (rtpmap?.includes('pcm')) {
         codec = 'pcm';
+    }
+    else if (rtpmap?.includes('l16')) {
+        codec = 'pcm_s16be';
+        ffmpegEncoder = 'pcm_s16be';
+    }
+    else if (rtpmap?.includes('speex')) {
+        codec = 'speex';
+        ffmpegEncoder = 'libspeex';
     }
     else if (rtpmap?.includes('h264')) {
         codec = 'h264';
@@ -199,16 +219,36 @@ export function parseRtpMap(mlineType: string, rtpmap: string) {
         codec = 'h265';
     }
     else if (!rtpmap && mlineType === 'audio') {
-        // ffmpeg seems to omit the rtpmap type for pcm alaw when creating sdp?
-        // is this the default?
-        codec = 'pcm_alaw';
+        if (mline.payloadTypes?.includes(0)) {
+            codec = 'pcm_mulaw';
+            ffmpegEncoder = 'pcm_mulaw';
+        }
+        else if (mline.payloadTypes?.includes(8)) {
+            codec = 'pcm_alaw';
+            ffmpegEncoder = 'pcm_alaw';
+        }
+        else if (mline.payloadTypes?.includes(14)) {
+            codec = 'mp3';
+            ffmpegEncoder = 'mp3';
+        }
+        else {
+            // ffmpeg seems to omit the rtpmap type for pcm alaw when creating sdp?
+            // is this the default?
+            // 2/21/2024: the paylaod types are included in the mline, and this is legacy code
+            // that maybe should be updated to use the mline payload types when no rtpmap(s) are available.
+            // https://en.wikipedia.org/wiki/RTP_payload_formats
+            codec = 'pcm_alaw';
+            ffmpegEncoder = 'pcm_alaw';
+        }
     }
 
     return {
         line: rtpmap,
         codec,
+        ffmpegEncoder,
         rawCodec: match?.[2],
         clock: parseInt(match?.[3]),
+        channels: parseInt(match?.[5]) || undefined,
         payloadType: parseInt(match?.[1]),
     }
 }
@@ -217,14 +257,14 @@ const acontrol = 'a=control:';
 const artpmap = 'a=rtpmap:';
 export function parseMSection(msection: string[]) {
     const control = msection.find(line => line.startsWith(acontrol))?.substring(acontrol.length);
-    const rtpmapFirst = msection.find(line => line.startsWith(artpmap));
     const mline = parseMLine(msection[0]);
-
-    let codec = parseRtpMap(mline.type, rtpmapFirst).codec;
-
-    const rtpmaps = msection.filter(line => line.startsWith(artpmap)).map(line => parseRtpMap(mline.type, line));
-
+    const rawRtpmaps = msection.filter(line => line.startsWith(artpmap));
+    const rtpmaps = rawRtpmaps.map(line => parseRtpMap(mline, line));
+    // if no rtp map is specified, pcm_alaw is used. parsing a null rtpmap is valid.
+    const rtpmap = parseRtpMap(mline, rawRtpmaps[0]);
+    const { codec } = rtpmap;
     let direction: string;
+
     for (const checkDirection of ['sendonly', 'sendrecv', 'recvonly', 'inactive']) {
         const found = msection.find(line => line === 'a=' + checkDirection);
         if (found) {
@@ -241,6 +281,7 @@ export function parseMSection(msection: string[]) {
         contents: msection.join('\r\n'),
         control,
         codec,
+        rtpmap,
         direction,
         toSdp: () => {
             return ret.lines.join('\r\n');
@@ -302,7 +343,9 @@ export function getSpsPps(
     }
 ) {
     const spspps = section?.fmtp?.[0]?.parameters?.['sprop-parameter-sets']?.split(',');
-    if (!spspps) {
+    // empty sprop-parameter-sets is apparently a thing:
+    //     a=fmtp:96 profile-level-id=420029; packetization-mode=1; sprop-parameter-sets=
+    if (spspps?.length !== 2) {
         return {
             sps: undefined,
             pps: undefined,
@@ -314,5 +357,35 @@ export function getSpsPps(
     return {
         sps: Buffer.from(sps, 'base64'),
         pps: Buffer.from(pps, 'base64'),
+    }
+}
+
+export function getSpsPpsVps(
+    section: {
+        fmtp: {
+            payloadType: number;
+            parameters: {
+                [key: string]: string;
+            };
+        }[]
+    }
+) {
+    const parameters = section?.fmtp?.[0]?.parameters;
+    if (!parameters) {
+        return {
+            sps: undefined,
+            pps: undefined,
+            vps: undefined,
+        };
+    }
+
+    const sps = parameters['sprop-sps'];
+    const pps = parameters['sprop-pps'];
+    const vps = parameters['sprop-vps'];
+
+    return {
+        sps: sps ? Buffer.from(sps, 'base64') : undefined,
+        pps: pps ? Buffer.from(pps, 'base64') : undefined,
+        vps: vps ? Buffer.from(vps, 'base64') : undefined,
     }
 }

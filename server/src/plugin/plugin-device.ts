@@ -7,6 +7,7 @@ import { PrimitiveProxyHandler, RpcPeer } from "../rpc";
 import { ScryptedRuntime } from "../runtime";
 import { sleep } from "../sleep";
 import { getState } from "../state";
+import { AccessControls } from "./acl";
 import { allInterfaceProperties, getInterfaceMethods, getPropertyInterfaces } from "./descriptor";
 import { PluginError } from "./plugin-error";
 
@@ -27,7 +28,7 @@ interface MixinTableEntry {
 export const RefreshSymbol = Symbol('ScryptedDeviceRefresh');
 export const QueryInterfaceSymbol = Symbol("ScryptedPluginDeviceQueryInterface");
 
-export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, ScryptedDevice {
+export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any> {
     scrypted: ScryptedRuntime;
     id: string;
     mixinTable: MixinTable[];
@@ -55,23 +56,23 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
             // allow mixins in the process of being released to manage final
             // events, etc, before teardown.
             this.releasing.add(proxy);
-            mixinProvider?.releaseMixin(this.id, proxy);
+            mixinProvider?.releaseMixin(this.id, proxy).catch(() => { });
             await sleep(1000);
             this.releasing.delete(proxy);
         })().catch(() => { });
     }
 
-    async isMixin(id: string, mixinDevice: any) {
+    async getMixinProviderId(id: string, mixinDevice: any) {
         if (this.releasing.has(mixinDevice))
             return true;
         await this.scrypted.devices[id].handler.ensureProxy();
         for (const mixin of this.scrypted.devices[id].handler.mixinTable) {
             const { proxy } = await mixin.entry;
             if (proxy === mixinDevice) {
-                return true;
+                return mixin.mixinProviderId || id;
             }
         }
-        return false;
+        return undefined;
     }
 
     // should this be async?
@@ -160,7 +161,7 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
                         console.warn('no device was returned by the plugin', this.id);
                 }
                 catch (e) {
-                    console.warn('error occured retrieving device from plugin');
+                    console.error('error occurred retrieving device from plugin', e);
                 }
 
                 const interfaces: ScryptedInterface[] = getState(pluginDevice, ScryptedInterfaceProperty.providedInterfaces) || [];
@@ -202,7 +203,16 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
         }
 
         return this.mixinTable[0].entry.then(entry => {
-            this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.interfaces, PluginDeviceProxyHandler.sortInterfaces(entry.allInterfaces));
+            if (entry.error) {
+                console.error('Mixin device creation completed with error. Merging with previous interface set to retain device descriptor.');
+                const previousInterfaces = getState(pluginDevice, ScryptedInterfaceProperty.interfaces) as string[] || [];
+                const allInterfaces = new Set([...entry.allInterfaces, ...previousInterfaces]);
+                entry.allInterfaces = [...allInterfaces];
+            }
+
+            const changed = this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.interfaces, PluginDeviceProxyHandler.sortInterfaces(entry.allInterfaces));
+            if (changed)
+                this.scrypted.notifyPluginDeviceDescriptorChanged(pluginDevice);
             return pluginDevice;
         });
     }
@@ -213,19 +223,35 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
 
         const type = getDisplayType(pluginDevice);
 
-        let { allInterfaces } = await previousEntry;
+        let { allInterfaces, error } = await previousEntry;
         try {
             const mixinProvider = this.scrypted.getDevice(mixinId) as ScryptedDevice & MixinProvider;
-            const interfaces = mixinProvider?.interfaces?.includes(ScryptedInterface.MixinProvider) && await mixinProvider?.canMixin(type, allInterfaces) as any as ScryptedInterface[];
+            const isMixinProvider = mixinProvider?.interfaces?.includes(ScryptedInterface.MixinProvider);
+            const interfaces = isMixinProvider && await mixinProvider?.canMixin(type, allInterfaces) as any as ScryptedInterface[];
             if (!interfaces) {
+                console.log(`Mixin provider ${mixinId} can no longer mixin ${this.id}.`, {
+                    mixinProvider: !!mixinProvider,
+                    interfaces,
+                });
+                if (!error) {
+                    if (!mixinProvider || (isMixinProvider && !interfaces)) {
+                        const mixins: string[] = getState(pluginDevice, ScryptedInterfaceProperty.mixins) || [];
+                        this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.mixins, mixins.filter(mid => mid !== mixinId));
+                        this.scrypted.notifyPluginDeviceDescriptorChanged(pluginDevice);
+                        this.scrypted.datastore.upsert(pluginDevice);
+                    }
+                    else {
+                        console.log(`Mixin provider ${mixinId} can not mixin ${this.id}. It is no longer a MixinProvider. This may be temporary. Passing through.`);
+                    }
+                }
+                else {
+                    console.error(`Error encountered in previous mixin entry may have caused mixin error. Ignoring.`);
+                }
                 // this is not an error
                 // do not advertise interfaces so it is skipped during
                 // vtable lookup.
-                console.log(`mixin provider ${mixinId} can no longer mixin ${this.id}`);
-                const mixins: string[] = getState(pluginDevice, ScryptedInterfaceProperty.mixins) || [];
-                this.scrypted.stateManager.setPluginDeviceState(pluginDevice, ScryptedInterfaceProperty.mixins, mixins.filter(mid => mid !== mixinId))
-                this.scrypted.datastore.upsert(pluginDevice);
                 return {
+                    error,
                     passthrough: true,
                     allInterfaces,
                     interfaces: new Set<string>(),
@@ -247,7 +273,7 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
             const propertyInterfaces = getPropertyInterfaces(host.api.descriptors || ScryptedInterfaceDescriptors);
             // todo: remove this and pass the setter directly.
             const deviceState = await host.remote.createDeviceState(this.id,
-                async (property, value) => this.scrypted.stateManager.setPluginDeviceState(pluginDevice, property, value, propertyInterfaces[property]));
+                async (property, value) => this.scrypted.stateManager.setPluginDeviceStateFromMixin(pluginDevice, property, value, propertyInterfaces[property], mixinId));
             const mixinProxy = await mixinProvider.getMixin(wrappedProxy, previousInterfaces as ScryptedInterface[], deviceState);
             if (!mixinProxy)
                 throw new PluginError(`mixin provider ${mixinId} did not return mixin for ${this.id}`);
@@ -260,6 +286,7 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
             const passthrough = wrappedProxy === mixinProxy && previousInterfaces.length === combinedInterfaces.length;
 
             return {
+                error,
                 passthrough,
                 interfaces: new Set<string>(interfaces),
                 allInterfaces: combinedInterfaces,
@@ -272,7 +299,7 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
             // this has been the behavior for a while,
             // but maybe interfaces implemented by that mixin
             // should rethrow the error caught here in applyMixin.
-            console.warn('mixin error', e);
+            console.error('Mixin error', e);
             return {
                 passthrough: false,
                 allInterfaces,
@@ -325,6 +352,9 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
         this.scrypted.stateManager.setPluginDeviceState(device, ScryptedInterfaceProperty.type, type);
         this.scrypted.stateManager.updateDescriptor(device);
     }
+    async setMixins(mixins: string[]): Promise<void> {
+
+    }
 
     async probe(): Promise<boolean> {
         try {
@@ -341,8 +371,11 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
         if (found) {
             const { mixin, entry } = found;
             const { proxy } = entry;
-            if (!proxy)
-                throw new PluginError(`device is unavailable ${this.id} (mixin ${mixin.mixinProviderId})`);
+            if (!proxy) {
+                const pluginDevice = this.scrypted.findPluginDeviceById(this.id);
+                const name = pluginDevice ? 'Unknown Device' : getState(pluginDevice, ScryptedInterfaceProperty.name);
+                throw new PluginError(`device "${name}" is unavailable [id: ${this.id}] [mixin: ${mixin.mixinProviderId}]`);
+            }
             return proxy[method](...argArray);
         }
 
@@ -353,12 +386,17 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
         for (const mixin of this.mixinTable) {
             const entry = await mixin.entry;
             if (!entry.methods) {
-                const pluginDevice = this.scrypted.findPluginDeviceById(mixin.mixinProviderId || this.id);
-                const plugin = this.scrypted.plugins[pluginDevice.pluginId];
-                let methods = new Set<string>(getInterfaceMethods(ScryptedInterfaceDescriptors, entry.interfaces))
-                if (plugin.api.descriptors)
-                    methods = new Set<string>([...methods, ...getInterfaceMethods(plugin.api.descriptors, entry.interfaces)]);
-                entry.methods = methods;
+                if (entry.interfaces.size) {
+                    const pluginDevice = this.scrypted.findPluginDeviceById(mixin.mixinProviderId || this.id);
+                    const plugin = this.scrypted.plugins[pluginDevice.pluginId];
+                    let methods = new Set<string>(getInterfaceMethods(ScryptedInterfaceDescriptors, entry.interfaces))
+                    if (plugin?.api.descriptors)
+                        methods = new Set<string>([...methods, ...getInterfaceMethods(plugin.api.descriptors, entry.interfaces)]);
+                    entry.methods = methods;
+                }
+                else {
+                    entry.methods = new Set();
+                }
             }
             if (entry.methods.has(method)) {
                 return { mixin, entry };
@@ -379,6 +417,11 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
     async apply(target: any, thisArg: any, argArray?: any): Promise<any> {
         const method = target();
 
+        const { activeRpcPeer } = RpcPeer;
+        const acl: AccessControls = activeRpcPeer?.tags?.acl;
+        if (acl?.shouldRejectMethod(this.id, method))
+            acl.deny();
+
         this.ensureProxy();
         const pluginDevice = this.scrypted.findPluginDeviceById(this.id);
 
@@ -387,6 +430,8 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
 
         if (method === QueryInterfaceSymbol) {
             const iface = argArray[0];
+            if (iface === ScryptedInterface.ScryptedDevice)
+                return this.id;
             const found = await this.findMixin(iface);
             if (found?.entry.interfaces.has(iface)) {
                 return found.mixin.mixinProviderId || this.id;
@@ -425,9 +470,14 @@ export class PluginDeviceProxyHandler implements PrimitiveProxyHandler<any>, Scr
         }
 
         if (method === 'createDevice') {
-            const nativeId = await this.applyMixin(method, argArray);
-            const newDevice = this.scrypted.findPluginDevice(pluginDevice.pluginId, nativeId);
-            return newDevice._id;
+            const idOrNativeId = await this.applyMixin(method, argArray);
+            // TODO: 2/17/2023 deprecate this old code path
+            let newDevice = this.scrypted.findPluginDevice(pluginDevice.pluginId, idOrNativeId);
+            if (newDevice) {
+                console.warn(`${pluginDevice.pluginId} is returning legacy nativeId value from createDevice.`);
+                return newDevice._id;
+            }
+            return idOrNativeId;
         }
 
         return this.applyMixin(method, argArray);

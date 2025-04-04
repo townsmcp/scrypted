@@ -1,12 +1,13 @@
-import * as faceapi from "face-api.js";
+import sdk from '@scrypted/sdk';
 
-export function makeBoundingBoxFromFace(face: faceapi.WithFaceDescriptor<faceapi.WithFaceLandmarks<{
-    detection: faceapi.FaceDetection;
-}, faceapi.FaceLandmarks68>>
-): [number, number, number, number] {
-    return makeBoundingBox(face.detection.box);
+export function safeParseJson(value: string) {
+    try {
+        return JSON.parse(value);
+    }
+    catch (e) {
+    }
 }
 
-export function makeBoundingBox(box: faceapi.Box<any>): [number, number, number, number] {
-    return [box.x, box.y, box.width, box.height];
+export function getAllDevices() {
+    return Object.keys(sdk.systemManager.getSystemState()).map(id => sdk.systemManager.getDeviceById(id));
 }

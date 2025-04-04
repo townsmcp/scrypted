@@ -1,4 +1,4 @@
-import { EventListener, EventListenerOptions, EventListenerRegister, Logger, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptor, ScryptedInterfaceDescriptors, ScryptedInterfaceProperty, SystemDeviceState, SystemManager } from "@scrypted/types";
+import { EventListener, EventListenerOptions, EventListenerRegister, Logger, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptor, ScryptedInterfaceDescriptors, ScryptedInterfaceProperty, ScryptedNativeId, SystemDeviceState, SystemManager } from "@scrypted/types";
 import { EventRegistry } from "../event-registry";
 import { PrimitiveProxyHandler, RpcPeer } from '../rpc';
 import { getInterfaceMethods, getInterfaceProperties, getPropertyInterfaces, isValidInterfaceMethod, propertyInterfaces } from "./descriptor";
@@ -9,7 +9,8 @@ function newDeviceProxy(id: string, systemManager: SystemManagerImpl) {
     return new Proxy(handler, handler);
 }
 
-class DeviceProxyHandler implements PrimitiveProxyHandler<any>, ScryptedDevice {
+class DeviceProxyHandler implements PrimitiveProxyHandler<any> {
+    customProperties: Map<string | number | symbol, any>;
     device: Promise<ScryptedDevice>;
     constructor(public id: string, public systemManager: SystemManagerImpl) {
     }
@@ -43,15 +44,39 @@ class DeviceProxyHandler implements PrimitiveProxyHandler<any>, ScryptedDevice {
         }
     }
 
+    deleteProperty(target: any, p: string | symbol): boolean {
+        const prop = p.toString();
+        if (Object.keys(ScryptedInterfaceProperty).includes(prop))
+            return false;
+
+        this.customProperties ||= new Map();
+        this.customProperties.set(p, undefined);
+        return true;
+    }
+
+    set(target: any, p: string | symbol, newValue: any, receiver: any): boolean {
+        const prop = p.toString();
+        if (Object.keys(ScryptedInterfaceProperty).includes(prop))
+            return false;
+
+        this.customProperties ||= new Map();
+        this.customProperties.set(p, newValue);
+
+        return true;
+    }
+
     get(target: any, p: PropertyKey, receiver: any): any {
         if (p === 'id')
             return this.id;
+
+        if (this.customProperties?.has(p))
+            return this.customProperties.get(p);
 
         const handled = RpcPeer.handleFunctionInvocations(this, target, p, receiver);
         if (handled)
             return handled;
 
-        const interfaces = new Set<string>(this.systemManager.state[this.id].interfaces.value);
+        const interfaces = new Set<string>(this.systemManager.state[this.id].interfaces?.value || []);
         const prop = p.toString();
         const isValidProperty = this.systemManager.propertyInterfaces?.[prop] || propertyInterfaces[prop];
 
@@ -93,6 +118,11 @@ class DeviceProxyHandler implements PrimitiveProxyHandler<any>, ScryptedDevice {
     }
     async setType(type: ScryptedDeviceType): Promise<void> {
         return this.systemManager.api.setDeviceProperty(this.id, ScryptedInterfaceProperty.type, type);
+    }
+
+    async setMixins(mixins: string[]) {
+        const plugins = await this.systemManager.getComponent('plugins');// as PluginComponent;
+        await plugins.setMixins(this.id, mixins);
     }
 
     async probe(): Promise<boolean> {
@@ -144,8 +174,29 @@ export class SystemManagerImpl implements SystemManager {
         return this.state;
     }
 
-    getDeviceById(id: string): any {
-        if (!this.state[id])
+    getDeviceById(idOrPluginId: string, nativeId?: ScryptedNativeId): any {
+        let id: string;
+        if (this.state[idOrPluginId]) {
+            // don't allow invalid input on nativeId, must be nullish if there is an exact id match.
+            if (nativeId != null)
+                return;
+            id = idOrPluginId;
+        }
+        else {
+            for (const check of Object.keys(this.state)) {
+                const state = this.state[check];
+                if (!state)
+                    continue;
+                if (state[ScryptedInterfaceProperty.pluginId]?.value === idOrPluginId) {
+                    // null and undefined should match here.
+                    if (state[ScryptedInterfaceProperty.nativeId]?.value == nativeId) {
+                        id = check;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!id)
             return;
         let proxy = this.deviceProxies[id];
         if (!proxy)
@@ -166,15 +217,11 @@ export class SystemManagerImpl implements SystemManager {
         return this.events.listen(makeOneWayCallback((id, eventDetails, eventData) => callback(this.getDeviceById(id), eventDetails, eventData)));
     }
     listenDevice(id: string, options: string | EventListenerOptions, callback: EventListener): EventListenerRegister {
-        let { event, watch } = (options || {}) as EventListenerOptions;
-        if (!event && typeof options === 'string')
-            event = options as string;
-        if (!event)
-            event = undefined;
+        let { watch } = (options || {}) as EventListenerOptions;
 
         // passive watching can be fast pathed to observe local state
         if (watch)
-            return this.events.listenDevice(id, event, (eventDetails, eventData) => callback(this.getDeviceById(id), eventDetails, eventData));
+            return this.events.listenDevice(id, options, (eventDetails, eventData) => callback(this.getDeviceById(id), eventDetails, eventData));
 
         return new EventListenerRegisterImpl(this.api.listenDevice(id, options, makeOneWayCallback((eventDetails, eventData) => callback(this.getDeviceById(id), eventDetails, eventData))));
     }

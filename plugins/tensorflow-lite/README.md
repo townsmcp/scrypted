@@ -1,15 +1,25 @@
-# @scrypted/tensorflow-lite
+# TensorFlow Lite Object Detection for Scrypted
 
-## npm commands
- * npm run scrypted-webpack
- * npm run scrypted-deploy <ipaddress>
- * npm run scrypted-debug <ipaddress>
+This plugin adds object detection capabilities to any camera in Scrypted. Having a fast GPU and CPU is highly recommended. Edge TPU (Coral.ai) is also supported.
 
-## scrypted distribution via npm
- 1. Ensure package.json is set up properly for publishing on npm.
- 2. npm publish
+The Tensorflow Lite Plugin should only be used if you are a Scrypted NVR user. It will provide no
+benefits to HomeKit, which does its own detection processing.
 
-## Visual Studio Code configuration
+## EdgeTPU Docker Instructions
 
-* If using a remote server, edit [.vscode/settings.json](blob/master/.vscode/settings.json) to specify the IP Address of the Scrypted server.
-* Launch Scrypted Debugger from the launch menu.
+To use a Coral EdgeTPU within docker, the docker host must install the EdgeTPU drivers:
+
+* EdgeTPU USB Drivers: https://coral.ai/docs/accelerator/get-started/
+* EdgeTPU M.2 or PCIe Drivers: https://coral.ai/docs/m2/get-started/
+
+<br/>
+Then bring the container down and back up on the host:
+<br/>
+<br/>
+
+
+```
+cd ~/.scrypted
+docker compose down
+docker compose up -d
+```

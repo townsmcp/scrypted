@@ -1,123 +1,352 @@
 import axios from 'axios';
-import sdk, { HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface } from '@scrypted/sdk';
-import { StorageSettings } from '@scrypted/common/src/settings';
-import { AutoenableMixinProvider } from '@scrypted/common/src/autoenable-mixin-provider';
-import { isSupported } from './types';
-import { DiscoveryEndpoint, DiscoverEvent } from 'alexa-smarthome-ts';
-import { AlexaHandler, capabilityHandlers, supportedTypes } from './types/common';
-import { createMessageId } from './message';
+import sdk, { HttpRequest, HttpRequestHandler, MixinProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, EventDetails, Setting, SettingValue, Settings, HttpResponseOptions, HttpResponse } from '@scrypted/sdk';
+import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { addBattery, addOnline, deviceErrorResponse, mirroredResponse, authErrorResponse, AlexaHttpResponse } from './common';
+import { supportedTypes } from './types';
+import { v4 as createMessageId } from 'uuid';
+import { ChangeReport, Discovery, DiscoveryEndpoint } from './alexa';
+import { alexaHandlers, alexaDeviceHandlers } from './handlers';
 
 const { systemManager, deviceManager } = sdk;
 
 const client_id = "amzn1.application-oa2-client.3283807e04d8408eb44a698c10f9dd13";
 const client_secret = "bed445e2b26730acd818b90e175b275f6b67b18ff8645e571c5b3e311fa75ee9";
+const includeToken = 4;
 
-class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler, MixinProvider {
+export let DEBUG = false;
+
+function debug(...args: any[]) {
+    if (DEBUG)
+        console.debug(...args);
+}
+
+class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, MixinProvider, Settings {
     storageSettings = new StorageSettings(this, {
         tokenInfo: {
             hide: true,
-            json: true,
+            json: true
         },
         syncedDevices: {
+            defaultValue: [],
             multiple: true,
+            hide: true
+        },
+        defaultIncluded: {
             hide: true,
+            json: true
+        },
+        apiEndpoint: {
+            title: 'Alexa Endpoint',
+            description: 'This is the endpoint Alexa will use to send events to. This is set after you login.',
+            type: 'string',
+            readonly: true
+        },
+        debug: {
+            title: 'Debug Events',
+            description: 'Log all events to the console. This will be very noisy and should not be left enabled.',
+            type: 'boolean',
+            onPut(oldValue: boolean, newValue: boolean) {
+                DEBUG = newValue;
+            }
+        },
+        pairedUserId: {
+            title: "Pairing Key",
+            description: "The pairing key used to validate requests from Alexa. Clear this key or delete the plugin to allow pairing with a different Alexa login.",
+        },
+        disableAutoAdd: {
+            title: "Disable auto add",
+            description: "Disable automatic enablement of devices.",
+            type: 'boolean',
+            defaultValue: false,
         },
     });
 
-    handlers = new Map<string, AlexaHandler>();
     accessToken: Promise<string>;
+    validAuths = new Set<string>();
+    devices = new Map<string, ScryptedDevice>();
 
     constructor(nativeId?: string) {
         super(nativeId);
 
-        this.handlers.set('Alexa.Authorization', this.alexaAuthorization);
-        this.handlers.set('Alexa.Discovery', this.alexaDiscovery);
+        DEBUG = this.storageSettings.values.debug ?? false;
 
-        this.syncDevices();
+        alexaHandlers.set('Alexa.Authorization/AcceptGrant', this.onAlexaAuthorization);
+        alexaHandlers.set('Alexa.Discovery/Discover', this.onDiscoverEndpoints);
 
-        systemManager.listen(async (eventSource, eventDetails, eventData) => {
-            if (!eventSource)
-                return;
-
-            if (!this.storageSettings.values.syncedDevices.includes(eventSource.id))
-                return;
-
-            const supportedType = supportedTypes.get(eventSource.type);
-            if (!supportedType) {
-                this.console.warn(`${eventSource.name} no longer supported type?`);
-                return;
-            }
-
-            const report = await supportedType.reportState(eventSource, eventDetails, eventData);
-
-            if (report?.type === 'event') {
-                const accessToken = await this.getAccessToken();
-                const data = {
-                    "context": {},
-                    "event": {
-                        "header": {
-                            "messageId": createMessageId(),
-                            "namespace": report.namespace,
-                            "name": report.name,
-                            "payloadVersion": "3"
-                        },
-                        "endpoint": {
-                            "scope": {
-                                "type": "BearerToken",
-                                "token": accessToken,
-                            },
-                            "endpointId": eventSource.id,
-                        },
-                        payload: report.payload,
-                    }
-                }
-
-                await this.postEvent(accessToken, data);
-            }
-        });
+        this.start()
+            .catch(e => {
+                this.console.error('startup failed', e);
+            })
     }
 
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any; }): Promise<any> {
-        return mixinDevice;
+    async start() {
+
+        for (const id of Object.keys(systemManager.getSystemState())) {
+            const device = systemManager.getDeviceById(id);
+            await this.tryEnableMixin(device);
+        }
+
+        systemManager.listen((async (eventSource: ScryptedDevice | undefined, eventDetails: EventDetails, eventData: any) => {
+            const status = await this.tryEnableMixin(eventSource);
+
+            // sync new devices when added or removed
+            if (status === DeviceMixinStatus.Setup)
+                await this.syncEndpoints();
+
+            if (status === DeviceMixinStatus.Setup || status === DeviceMixinStatus.AlreadySetup) {
+
+                if (!this.devices.has(eventSource.id)) {
+                    this.devices.set(eventSource.id, eventSource);
+                    eventSource.listen(ScryptedInterface.ObjectDetector, this.deviceListen.bind(this));
+                }
+
+                this.deviceListen(eventSource, eventDetails, eventData);
+            }
+        }).bind(this));
+
+        await this.syncEndpoints();
+    }
+
+    private async tryEnableMixin(device: ScryptedDevice): Promise<DeviceMixinStatus> {
+        if (!device)
+            return DeviceMixinStatus.NotSupported;
+
+        const mixins = (device.mixins || []).slice();
+        if (mixins.includes(this.id))
+            return DeviceMixinStatus.AlreadySetup;
+
+        const defaultIncluded = this.storageSettings.values.defaultIncluded || {};
+        if (defaultIncluded[device.id] === includeToken)
+            return DeviceMixinStatus.AlreadySetup;
+
+        if (!supportedTypes.has(device.type))
+            return DeviceMixinStatus.NotSupported;
+
+        if (this.storageSettings.values.disableAutoAdd) {
+            return DeviceMixinStatus.Skip;
+        }
+
+        mixins.push(this.id);
+
+        const plugins = await systemManager.getComponent('plugins');
+        await plugins.setMixins(device.id, mixins);
+
+        defaultIncluded[device.id] = includeToken;
+        this.storageSettings.values.defaultIncluded = defaultIncluded;
+
+        return DeviceMixinStatus.Setup;
+    }
+
+    async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]> {
+        const available = supportedTypes.has(type);
+
+        if (available)
+            return [];
+
+        return;
+    }
+
+    async getMixin(device: ScryptedDevice, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any }): Promise<any> {
+        return device;
     }
 
     async releaseMixin(id: string, mixinDevice: any): Promise<void> {
         const device = systemManager.getDeviceById(id);
-        if (device.mixins?.includes(this.id)) {
+        const mixins = (device.mixins || []).slice();
+        if (mixins.includes(this.id))
             return;
-        }
-        this.console.log('release mixin', id);
-        this.log.a(`${device.name} was removed. The Alexa plugin will reload momentarily.`);
-        deviceManager.requestRestart();
+
+        this.log.i(`Device removed from Alexa: ${device.name}. Requesting sync.`);
+        await this.syncEndpoints();
     }
 
-    async postEvent(accessToken: string, data: any) {
-        return axios.post('https://api.amazonalexa.com/v3/events', data, {
+    async deviceListen(eventSource: ScryptedDevice | undefined, eventDetails: EventDetails, eventData: any): Promise<void> {
+        if (!eventSource)
+            return;
+
+        if (!this.storageSettings.values.syncedDevices.includes(eventSource.id))
+            return;
+
+        if (eventDetails.eventInterface === ScryptedInterface.ScryptedDevice)
+            return;
+
+        const supportedType = supportedTypes.get(eventSource.type);
+        if (!supportedType)
+            return;
+
+        let report = await supportedType.sendEvent(eventSource, eventDetails, eventData);
+
+        if (!report && eventDetails.eventInterface === ScryptedInterface.Online) {
+            report = {};
+        }
+
+        if (!report && eventDetails.eventInterface === ScryptedInterface.Battery) {
+            report = {};
+        }
+
+        if (!report) {
+            debug(`${eventDetails.eventInterface}.${eventDetails.property} not supported for device ${eventSource.type}`);
+            return;
+        }
+
+        debug("event", eventDetails.eventInterface, eventDetails.property, eventSource.type);
+
+        let data = {
+            "event": {
+                "header": {
+                    "messageId": createMessageId(),
+                    "namespace": report?.event?.header?.namespace ?? "Alexa",
+                    "name": report?.event?.header?.name ?? "ChangeReport",
+                    "payloadVersion": "3"
+                },
+                "endpoint": {
+                    "endpointId": eventSource.id,
+                },
+                payload: report?.event?.payload
+            },
+            context: report?.context
+        } as ChangeReport;
+
+        data = addOnline(data, eventSource);
+        data = addBattery(data, eventSource);
+
+        // nothing to report
+        if (data.context === undefined && data.event.payload === undefined)
+            return;
+
+        data = await this.addAccessToken(data);
+
+        await this.postEvent(data);
+    }
+
+    private async addAccessToken(data: any): Promise<any> {
+        const accessToken = await this.getAccessToken();
+
+        if (data.event === undefined)
+            data.event = {};
+
+        if (data.event.endpoint === undefined)
+            data.event.endpoint = [];
+
+        data.event.endpoint.scope = {
+            "type": "BearerToken",
+            "token": accessToken,
+        };
+
+        return data;
+    }
+
+    getSettings(): Promise<Setting[]> {
+        return this.storageSettings.getSettings();
+    }
+
+    putSetting(key: string, value: SettingValue): Promise<void> {
+        return this.storageSettings.putSetting(key, value);
+    }
+
+    readonly endpoints: string[] = [
+        'api.amazonalexa.com',
+        'api.eu.amazonalexa.com',
+        'api.fe.amazonalexa.com'
+    ];
+
+    async getAlexaEndpoint(): Promise<string> {
+        if (this.storageSettings.values.apiEndpoint)
+            return this.storageSettings.values.apiEndpoint;
+
+        try {
+            const accessToken = await this.getAccessToken();
+            const response = await axios.get(`https://${this.endpoints[0]}/v1/alexaApiEndpoint`, {
+                headers: {
+                    'Authorization': 'Bearer ' + accessToken,
+                }
+            });
+
+            const endpoint: string = response.data.endpoints[0];
+            this.storageSettings.values.apiEndpoint = endpoint;
+            return endpoint;
+        } catch (err) {
+            this.console.error(err);
+
+            // default to NA/RoW endpoint if we can't get the endpoint.
+            return this.endpoints[0];
+        }
+    }
+
+    async postEvent(data: any) {
+        const accessToken = await this.getAccessToken();
+        const endpoint = await this.getAlexaEndpoint();
+        const self = this;
+
+        debug("send event to alexa", data);
+
+        return axios.post(`https://${endpoint}/v3/events`, data, {
             headers: {
                 'Authorization': 'Bearer ' + accessToken,
+            }
+        }).catch(error => {
+            self.console.error(error?.response?.data);
+
+            if (error?.response?.status === 401 || error?.response?.status === 403) {
+                self.storageSettings.values.tokenInfo = undefined;
+                self.accessToken = undefined;
             }
         });
     }
 
-    async syncDevices() {
-        const endpoints = await this.addOrUpdateReport();
+    async getEndpoints(): Promise<DiscoveryEndpoint[]> {
+        const endpoints: DiscoveryEndpoint[] = [];
+
+        for (const id of Object.keys(systemManager.getSystemState())) {
+            const device = systemManager.getDeviceById(id);
+
+            if (!device.mixins?.includes(this.id))
+                continue;
+
+            const endpoint = await this.getEndpointForDevice(device);
+            if (endpoint)
+                endpoints.push(endpoint);
+        }
+
+        return endpoints;
+    }
+
+    async onDiscoverEndpoints(request: HttpRequest, response: AlexaHttpResponse, directive: any) {
+        const endpoints = await this.getEndpoints();
+
+        const data = {
+            "event": {
+                "header": {
+                    "namespace": 'Alexa.Discovery',
+                    "name": 'Discover.Response',
+                    "payloadVersion": '3',
+                    "messageId": createMessageId()
+                },
+                "payload": {
+                    endpoints
+                }
+            }
+        } as Discovery;
+
+        response.send(data);
+
         await this.saveEndpoints(endpoints);
     }
 
-    async addOrUpdateReport() {
-        const endpoints = this.getDiscoveryEndpoints();
+    async syncEndpoints() {
+        const endpoints = await this.getEndpoints();
 
         if (!endpoints.length)
             return [];
 
         const accessToken = await this.getAccessToken();
-        await this.postEvent(accessToken, {
+        const data = {
             "event": {
                 "header": {
                     "namespace": "Alexa.Discovery",
                     "name": "AddOrUpdateReport",
                     "payloadVersion": "3",
-                    "messageId": createMessageId(),
+                    "messageId": createMessageId()
                 },
                 "payload": {
                     endpoints,
@@ -127,16 +356,40 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
                     }
                 }
             }
-        });
+        };
 
-        return endpoints;
+        await this.postEvent(data);
+
+        await this.saveEndpoints(endpoints);
     }
 
-    async deleteReport(...ids: string[]) {
+    async saveEndpoints(endpoints: DiscoveryEndpoint[]) {
+        const existingEndpoints: string[] = this.storageSettings.values.syncedDevices;
+        const newEndpoints = endpoints.map(endpoint => endpoint.endpointId);
+        const deleted = new Set(existingEndpoints);
+
+        for (const id of newEndpoints) {
+            deleted.delete(id);
+        }
+
+        const all = new Set([...existingEndpoints, ...newEndpoints]);
+
+        // save all the endpoints
+        this.storageSettings.values.syncedDevices = [...all];
+
+        // delete leftover endpoints
+        await this.deleteEndpoints(...deleted);
+
+        // prune if the delete report completed successfully
+        this.storageSettings.values.syncedDevices = newEndpoints;
+    }
+
+    async deleteEndpoints(...ids: string[]) {
         if (!ids.length)
             return;
+
         const accessToken = await this.getAccessToken();
-        return this.postEvent(accessToken, {
+        return this.postEvent({
             "event": {
                 "header": {
                     "namespace": "Alexa.Discovery",
@@ -157,27 +410,29 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
         })
     }
 
-    async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]> {
-        const discovery = isSupported({
-            type,
-            interfaces,
-        } as any);
-
-        if (!discovery)
-            return;
-        return [];
+    private setReauthenticateAlert() {
+        const msg: string = "Please reauthenticate by following the directions below.";
+        this.log.a(msg);
     }
 
     getAccessToken(): Promise<string> {
         if (this.accessToken)
             return this.accessToken;
 
+        this.log.clearAlerts();
+
         const { tokenInfo } = this.storageSettings.values;
+
+        if (tokenInfo === undefined) {
+            this.setReauthenticateAlert();
+            throw new Error("'tokenInfo' is undefined");
+        }
+
         const { code } = tokenInfo;
 
         const body: Record<string, string> = {
             client_id,
-            client_secret,
+            client_secret
         };
         if (code) {
             body.code = code;
@@ -189,18 +444,47 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
             body.grant_type = 'refresh_token';
         }
 
+        const self = this;
+
         const accessTokenPromise = (async () => {
             const response = await axios.post('https://api.amazon.com/auth/o2/token', new URLSearchParams(body).toString(), {
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 }
+            }).catch(error => {
+                switch (error?.response?.data?.error) {
+                    case 'invalid_client':
+                    case 'invalid_grant':
+                    case 'unauthorized_client':
+                        self.console.error(error?.response?.data);
+                        self.log.a(error?.response?.data?.error_description);
+                        self.storageSettings.values.tokenInfo = undefined;
+                        self.accessToken = undefined;
+                        break;
+
+                    case 'authorization_pending':
+                        self.console.warn(error?.response?.data);
+                        self.log.a(error?.response?.data?.error_description);
+                        break;
+
+                    case 'expired_token':
+                        self.console.warn(error?.response?.data);
+                        self.log.a(error?.response?.data?.error_description);
+                        self.accessToken = undefined;
+                        break;
+
+                    default:
+                        self.console.error(error?.response?.data);
+                }
+                throw error;
             });
+            // expires_in is 1 hr
             const { access_token, expires_in } = response.data;
             this.storageSettings.values.tokenInfo = response.data;
             setTimeout(() => {
                 if (this.accessToken === accessTokenPromise)
                     this.accessToken = undefined;
-            }, expires_in * 1000 - 30000);
+            }, (expires_in - 300) * 1000);
             return access_token;
         })();
 
@@ -209,13 +493,31 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
         return this.accessToken;
     }
 
-    async alexaAuthorization(request: HttpRequest, response: HttpResponse) {
-        const json = JSON.parse(request.body);
-        const { grant } = json.directive.payload;
+    async onAlexaAuthorization(request: HttpRequest, response: AlexaHttpResponse, directive: any) {
+        const { grant } = directive.payload;
         this.storageSettings.values.tokenInfo = grant;
-        this.getAccessToken();
+        this.storageSettings.values.apiEndpoint = undefined;
+        this.accessToken = undefined;
 
-        response.send(JSON.stringify({
+        const self = this;
+        let accessToken: any;
+
+        try {
+            accessToken = await this.getAccessToken();
+        }
+        catch (reason) {
+            self.console.error(`Failed to handle the AcceptGrant directive because ${reason}`);
+
+            this.storageSettings.values.tokenInfo = undefined;
+            this.storageSettings.values.apiEndpoint = undefined;
+            this.accessToken = undefined;
+
+            response.send(authErrorResponse("ACCEPT_GRANT_FAILED", `Failed to handle the AcceptGrant directive because ${reason}`, directive));
+
+            return;
+        };
+        this.log.clearAlerts();
+        response.send({
             "event": {
                 "header": {
                     "namespace": "Alexa.Authorization",
@@ -225,47 +527,70 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
                 },
                 "payload": {}
             }
-        }));
+        });
     }
 
-    createEndpoint(device: ScryptedDevice): DiscoveryEndpoint<any> {
+    async getEndpointForDevice(device: ScryptedDevice): Promise<DiscoveryEndpoint> {
         if (!device)
             return;
-        const discovery = isSupported(device);
+
+        const discovery = await supportedTypes.get(device.type)?.discover(device);
         if (!discovery)
             return;
 
-        const ret = Object.assign({
+        const data: DiscoveryEndpoint = {
             endpointId: device.id,
-            manufacturerName: device.info?.manufacturer || 'Scrypted Camera',
-            description: device.type,
+            manufacturerName: "Scrypted",
+            description: `${device.info?.manufacturer ?? 'Unknown'} ${device.info?.model ?? `device of type ${device.type}`}, connected via Scrypted`,
             friendlyName: device.name,
-        }, discovery);
-
-        ret.capabilities.push(
-            {
-                "type": "AlexaInterface",
-                "interface": "Alexa.EndpointHealth",
-                "version": "3.2" as any,
-                "properties": {
-                    "supported": [
-                        {
-                            "name": "connectivity"
-                        },
-                        // {
-                        //     "name": "battery"
-                        // },
-                        // {
-                        //     "name": "radioDiagnostics"
-                        // },
-                        // {
-                        //     "name": "networkThroughput"
-                        // }
-                    ],
-                    "proactivelyReported": true,
-                    "retrievable": true
-                }
+            additionalAttributes: {
+                manufacturer: device.info?.manufacturer || undefined,
+                model: device.info?.model || undefined,
+                serialNumber: device.info?.serialNumber || undefined,
+                firmwareVersion: device.info?.firmware || undefined,
+                softwareVersion: device.info?.version || undefined
             },
+            displayCategories: discovery.displayCategories,
+            capabilities: discovery.capabilities
+        };
+
+        let supportedEndpointHealths: any[] = [];
+
+        if (device.interfaces.includes(ScryptedInterface.Online)) {
+            supportedEndpointHealths.push({
+                "name": "connectivity"
+            });
+        }
+
+        // {
+        //     "name": "radioDiagnostics"
+        // },
+        // {
+        //     "name": "networkThroughput"
+        // }
+
+        if (device.interfaces.includes(ScryptedInterface.Battery)) {
+            supportedEndpointHealths.push({
+                "name": "battery"
+            })
+        }
+
+        if (supportedEndpointHealths.length > 0) {
+            data.capabilities.push(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.EndpointHealth",
+                    "version": "3.2",
+                    "properties": {
+                        "supported": supportedEndpointHealths,
+                        "proactivelyReported": true,
+                        "retrievable": true
+                    }
+                }
+            );
+        }
+
+        data.capabilities.push(
             {
                 "type": "AlexaInterface",
                 "interface": "Alexa",
@@ -273,98 +598,137 @@ class AlexaPlugin extends AutoenableMixinProvider implements HttpRequestHandler,
             }
         );
 
-        return ret as any;
-    }
-
-    async saveEndpoints(endpoints: DiscoveryEndpoint<any>[]) {
-        const existingEndpoints: string[] = this.storageSettings.values.syncedDevices;
-        const newEndpoints = endpoints.map(endpoint => endpoint.endpointId);
-        const deleted = new Set(existingEndpoints);
-
-        for (const id of newEndpoints) {
-            deleted.delete(id);
-        }
-
-        const all = new Set([...existingEndpoints, ...newEndpoints]);
-
-        // save all the endpoints
-        this.storageSettings.values.syncedDevices = [...all];
-
-        // delete leftover endpoints
-        await this.deleteReport(...deleted);
-
-        // prune if the delete report completed successfully
-        this.storageSettings.values.syncedDevices = newEndpoints;
-    }
-
-    getDiscoveryEndpoints() {
-        const endpoints: DiscoveryEndpoint<any>[] = [];
-
-        for (const id of Object.keys(systemManager.getSystemState())) {
-            const device = systemManager.getDeviceById(id);
-
-            if (!device.mixins?.includes(this.id))
-                continue;
-            const endpoint = this.createEndpoint(device);
-            if (endpoint)
-                endpoints.push(endpoint);
-        }
-        return endpoints;
-    }
-
-    async alexaDiscovery(request: HttpRequest, response: HttpResponse) {
-        const endpoints = this.getDiscoveryEndpoints();
-
-        const ret: DiscoverEvent<any> = {
-            event: {
-                header: {
-                    namespace: 'Alexa.Discovery',
-                    name: 'Discover.Response',
-                    messageId: createMessageId(),
-                    payloadVersion: '3',
-                },
-                payload: {
-                    endpoints,
+        if (device.info?.mac !== undefined)
+            data.connections = [
+                {
+                    "type": "TCP_IP",
+                    "macAddress": device.info.mac
                 }
+            ];
+
+        return data as any;
+    }
+
+    async onRequest(request: HttpRequest, rawResponse: HttpResponse) {
+        const response = new HttpResponseLoggingImpl(rawResponse, this.console);
+
+        const { authorization } = request.headers;
+        if (!this.validAuths.has(authorization)) {
+            try {
+                debug("making authorization request to Scrypted");
+
+                const getcookieResponse = await axios.get('https://home.scrypted.app/_punch/getcookie', {
+                    headers: {
+                        'Authorization': authorization,
+                    }
+                });
+                // new tokens will contain a lot of information, including the expiry and client id.
+                // validate this. old tokens will be grandfathered in.
+                if (getcookieResponse.data.expiry && getcookieResponse.data.clientId !== 'amazon')
+                    throw new Error('client id mismatch');
+                if (!this.storageSettings.values.pairedUserId) {
+                    this.storageSettings.values.pairedUserId = getcookieResponse.data.id;
+                }
+                else if (this.storageSettings.values.pairedUserId !== getcookieResponse.data.id) {
+                    this.log.a('This plugin is already paired with a different account. Clear the existing key in the plugin settings to pair this plugin with a different account.');
+                    throw new Error('user id mismatch');
+                }
+                this.validAuths.add(authorization);
+            }
+            catch (e) {
+                this.console.error(`request failed due to invalid authorization`, e);
+                response.send(e.message, {
+                    code: 500,
+                });
+                return;
             }
         }
 
-        response.send(JSON.stringify(ret));
+        const body = JSON.parse(request.body);
+        const { directive } = body;
+        const { namespace, name } = directive.header;
 
-        this.saveEndpoints(endpoints);
+        const mapName = `${namespace}/${name}`;
+
+        debug("received directive from alexa", mapName, body);
+
+        const handler = alexaHandlers.get(mapName);
+        if (handler) {
+            await handler.apply(this, [request, response, directive]);
+            return;
+        }
+
+        const deviceHandler = alexaDeviceHandlers.get(mapName);
+
+        const getDevice = () => {
+            const device = systemManager.getDeviceById(directive.endpoint.endpointId);
+            if (!device || !device.mixins.includes(this.id)) {
+                response.send(deviceErrorResponse("NO_SUCH_ENDPOINT", "The device doesn't exist in Scrypted or was removed from the Alexa Plugin", directive));
+                this.deleteEndpoints(directive.endpoint.endpointId).catch(() => { });
+                return;
+            }
+            return device;
+        }
+
+        if (deviceHandler) {
+            const device = getDevice();
+            if (!device)
+                return;
+            await deviceHandler.apply(this, [request, response, directive, device]);
+            return;
+        } else {
+            this.console.error(`no handler for: ${mapName}`);
+            if (!getDevice())
+                return;
+        }
+
+        // it is better to send a non-specific response than an error, as the API might get rate throttled
+        response.send(mirroredResponse(directive));
+    }
+}
+
+enum DeviceMixinStatus {
+    NotSupported = 0,
+    Setup = 1,
+    AlreadySetup = 2,
+    Skip = 3,
+}
+
+class HttpResponseLoggingImpl implements AlexaHttpResponse {
+    constructor(private response: HttpResponse, private console: Console) {
     }
 
-    async onRequest(request: HttpRequest, response: HttpResponse) {
-        try {
-            const body = JSON.parse(request.body);
-            const { directive } = body;
-            const { namespace } = directive.header;
-            const handler = this.handlers.get(namespace);
-            if (handler)
-                return handler.apply(this, arguments);
+    send(body: string): void;
+    send(body: string, options: HttpResponseOptions): void;
+    send(body: Buffer): void;
+    send(body: Buffer, options: HttpResponseOptions): void;
+    send(body: any, options?: any): void {
+        if (!options)
+            options = {};
 
-            const capHandler = capabilityHandlers.get(namespace);
-            if (capHandler) {
-                const device = systemManager.getDeviceById(directive.endpoint.endpointId);
-                if (!device) {
-                    response.send('Not Found', {
-                        code: 404,
-                    });
-                    return;
-                }
+        if (!options.code)
+            options.code = 200;
 
-                return capHandler.apply(this, [request, response, directive, device]);
-            }
+        if (options.code !== 200)
+            this.console.error(`response error ${options.code}:`, body);
+        else
+            debug("response to alexa directive", options.code, body);
 
-            response.send('Not Found', {
-                code: 404,
-            });
-        }
-        catch (e) {
-            response.send(e.message, {
-                code: 500,
-            });
-        }
+        if (typeof body === 'object')
+            body = JSON.stringify(body);
+
+        this.response.send(body, options);
+    }
+    sendFile(path: string): void;
+    sendFile(path: string, options: HttpResponseOptions): void;
+    sendFile(path: any, options?: any): void {
+        this.response.sendFile(path, options);
+    }
+    sendSocket(socket: any, options: HttpResponseOptions): void {
+        this.response.sendSocket(socket, options);
+    }
+    sendStream(stream: AsyncGenerator<Buffer, void>, options?: HttpResponseOptions): void {
+        this.response.sendStream(stream, options);
     }
 }
 

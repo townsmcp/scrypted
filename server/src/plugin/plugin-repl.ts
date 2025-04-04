@@ -1,12 +1,11 @@
-import { listenZero } from '../listen-zero';
-import { Server } from 'net';
+import { ScryptedStatic } from '@scrypted/types';
 import { once } from 'events';
 import repl from 'repl';
-import { ScryptedStatic } from '@scrypted/types';
+import { clusterListenZero } from '../cluster/cluster-setup';
 
 export async function createREPLServer(scrypted: ScryptedStatic, params: any, plugin: any): Promise<number> {
     const { deviceManager, systemManager } = scrypted;
-    const server = new Server(async (socket) => {
+    const { server, port } = await clusterListenZero(async (socket) => {
         let [filter] = await once(socket, 'data');
         filter = filter.toString().trim();
         if (filter === 'undefined')
@@ -37,13 +36,16 @@ export async function createREPLServer(scrypted: ScryptedStatic, params: any, pl
         const ctx = Object.assign(params, {
             device,
             realDevice,
+            sdk: scrypted,
         });
         delete ctx.console;
         delete ctx.window;
         delete ctx.WebSocket;
         delete ctx.pluginHostAPI;
+        delete ctx.log;
+        delete ctx.pluginRuntimeAPI;
 
-        const replFilter = new Set<string>(['require', 'localStorage', 'exports', '__filename'])
+        const replFilter = new Set<string>(['require', 'localStorage', 'exports', '__filename', 'log'])
         const replVariables = Object.keys(ctx).filter(key => !replFilter.has(key));
 
         const welcome = `JavaScript REPL variables:\n${replVariables.map(key => '  ' + key).join('\n')}\n\n`;
@@ -72,5 +74,6 @@ export async function createREPLServer(scrypted: ScryptedStatic, params: any, pl
         socket.on('error', cleanup);
         socket.on('end', cleanup);
     });
-    return listenZero(server);
+
+    return port;
 }

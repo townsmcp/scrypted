@@ -65,6 +65,7 @@ export class ZwaveDeviceBase extends ScryptedDeviceBase implements Refresh, Sett
     }
 
     onValueChanged(valueId: ZWaveNodeValueUpdatedArgs) {
+        this.console.log('value changed', valueId);
         var cc = getCommandClassIndex(valueId.commandClass, valueId.property as number);
         if (!cc) {
             cc = getCommandClass(valueId.commandClass);
@@ -201,13 +202,6 @@ export class ZwaveDeviceBase extends ScryptedDeviceBase implements Refresh, Sett
                 readonly: true,
                 value: this.statistics ? `${this.statistics.commandsDroppedRX} / ${this.statistics.commandsDroppedTX}` : 'n/a',
             },
-            {
-                group: 'Statistics',
-                title: 'RTT',
-                key: 'zwave:rtt',
-                readonly: true,
-                value: this.statistics ? `${this.statistics.rtt}ms` : 'n/a',
-            }
         ];
     }
 

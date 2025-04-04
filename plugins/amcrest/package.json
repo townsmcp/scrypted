@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/amcrest",
-   "version": "0.0.103",
+   "version": "0.0.165",
    "description": "Amcrest Plugin for Scrypted",
    "author": "Scrypted",
    "license": "Apache",
@@ -24,9 +24,11 @@
       "camera"
    ],
    "scrypted": {
-      "name": "Amcrest Camera Plugin",
+      "name": "Amcrest Plugin",
       "type": "DeviceProvider",
       "interfaces": [
+         "ScryptedSystemDevice",
+         "ScryptedDeviceCreator",
          "DeviceProvider",
          "DeviceCreator"
       ],
@@ -35,13 +37,14 @@
       ]
    },
    "dependencies": {
-      "@koush/axios-digest-auth": "^0.8.5",
-      "@scrypted/sdk": "file:../../sdk",
       "@scrypted/common": "file:../../common",
-      "@types/multiparty": "^0.0.33",
-      "multiparty": "^4.2.2"
+      "@scrypted/sdk": "file:../../sdk",
+      "content-type": "^1.0.5",
+      "xml2js": "^0.6.2"
    },
    "devDependencies": {
-      "@types/node": "^16.11.0"
+      "@types/content-type": "^1.1.8",
+      "@types/node": "^20.11.30",
+      "@types/xml2js": "^0.4.14"
    }
 }

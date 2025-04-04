@@ -1,39 +1,22 @@
-[submodule "plugins/homekit/HAP-NodeJS"]
-	path = external/HAP-NodeJS
-	url = ../../koush/HAP-NodeJS
 [submodule "plugins/unifi-protect/src/unifi-protect"]
 	path = external/unifi-protect
 	url = ../../koush/unifi-protect.git
-[submodule "plugins/myq/src/myq"]
-	path = plugins/myq/src/myq
-	url = ../../koush/myq.git
-[submodule "plugins/neato/node-botvac"]
-	path = plugins/neato/node-botvac
-	url = ../../koush/node-botvac
-[submodule "plugins/tensorflow/face-api.js"]
-	path = external/face-api.js
-	url = ../../koush/face-api.js
-[submodule "external/axios-digest-auth"]
-	path = external/axios-digest-auth
-	url = ../../koush/axios-digest-auth
-[submodule "external/scrypted-ffmpeg"]
-	path = external/scrypted-ffmpeg
-	url = ../../koush/scrypted-ffmpeg
 [submodule "external/ring-client-api"]
 	path = external/ring-client-api
 	url = ../../koush/ring
+	branch = fork
 [submodule "plugins/vscode-typescript"]
 	path = plugins/vscode-typescript
 	url = ../../koush/scrypted-vscode-typescript/
 [submodule "external/werift"]
 	path = external/werift
 	url = ../../koush/werift-webrtc
-[submodule "plugins/zwave/file-stream-rotator"]
-	path = plugins/zwave/file-stream-rotator
-	url = ../../koush/file-stream-rotator.git
-[submodule "plugins/roborock/homebridge-xiaomi-roborock-vacuum"]
-	path = plugins/roborock/homebridge-xiaomi-roborock-vacuum
-	url = https://github.com/homebridge-xiaomi-roborock-vacuum/homebridge-xiaomi-roborock-vacuum.git
-[submodule "external/onvif"]
-	path = external/onvif
-	url = git@github.com:koush/onvif.git
+[submodule "plugins/sample-cameraprovider"]
+	path = plugins/sample-cameraprovider
+	url = ../../koush/scrypted-sample-cameraprovider
+[submodule "plugins/cloud/node-nat-upnp"]
+	path = plugins/cloud/external/node-nat-upnp
+	url = ../../koush/node-nat-upnp.git
+[submodule "plugins/wyze/docker-wyze-bridge"]
+	path = plugins/wyze/docker-wyze-bridge
+	url = ../../koush/docker-wyze-bridge.git

@@ -19,7 +19,7 @@ export async function read16BELengthLoop(readable: Readable, options: {
   let length: number;
   let skipCount = 0;
   let readCount = 0;
-  
+
   const resumeRead = () => {
     readCount++;
     read();
@@ -54,45 +54,18 @@ export async function read16BELengthLoop(readable: Readable, options: {
   readable.on('readable', read);
 
   await once(readable, 'end');
-  throw new Error('stream ended');
-}
-
-
-async function readLengthRaw(readable: Readable, length: number): Promise<Buffer> {
-  if (!length) {
-    return Buffer.alloc(0);
-  }
-
-  {
-    const ret = readable.read(length);
-    if (ret) {
-      return ret;
-    }
-  }
-
-  return new Promise((resolve, reject) => {
-    const r = () => {
-      const ret = readable.read(length);
-      if (ret) {
-        readable.removeListener('readable', r);
-        resolve(ret);
-      }
-    };
-
-
-    readable.on('readable', r);
-  });
+  throw new StreamEndError('read16BELengthLoop');
 }
 
 export class StreamEndError extends Error {
-  constructor() {
-    super()
+  constructor(where: string) {
+    super(`stream ended: ${where}`);
   }
 }
 
 export async function readLength(readable: Readable, length: number): Promise<Buffer> {
   if (readable.readableEnded || readable.destroyed)
-    throw new Error("stream ended");
+    throw new StreamEndError('readLength start');
 
   if (!length) {
     return Buffer.alloc(0);
@@ -115,12 +88,12 @@ export async function readLength(readable: Readable, length: number): Promise<Bu
       }
 
       if (readable.readableEnded || readable.destroyed)
-        reject(new Error("stream ended during read"));
+        reject(new StreamEndError('readLength readable'));
     };
 
     const e = () => {
       cleanup();
-      reject(new StreamEndError())
+      reject(new StreamEndError('readLength end'));
     };
 
     const cleanup = () => {
@@ -136,17 +109,26 @@ export async function readLength(readable: Readable, length: number): Promise<Bu
 const CHARCODE_NEWLINE = '\n'.charCodeAt(0);
 
 export async function readUntil(readable: Readable, charCode: number) {
-  const data = [];
-  let count = 0;
+  const queued: Buffer[] = [];
   while (true) {
-    const buffer = await readLength(readable, 1);
-    if (!buffer)
-      throw new Error("end of stream");
-    if (buffer[0] === charCode)
-      break;
-    data[count++] = buffer[0];
+    const available: Buffer = readable.read();
+    if (!available) {
+      await once(readable, 'readable');
+      continue;
+    }
+    const index = available.findIndex(b => b === charCode);
+    if (index === -1) {
+      queued.push(available);
+      continue;
+    }
+
+    const before = available.subarray(0, index);
+    queued.push(before);
+
+    const after = available.subarray(index + 1);
+    readable.unshift(after);
+    return Buffer.concat(queued).toString();
   }
-  return Buffer.from(data).toString();
 }
 
 export async function readLine(readable: Readable) {
@@ -154,12 +136,17 @@ export async function readLine(readable: Readable) {
 }
 
 export async function readString(readable: Readable | Promise<Readable>) {
-  let data = '';
+  const buffer = await readBuffer(readable);
+  return buffer.toString();
+}
+
+export async function readBuffer(readable: Readable | Promise<Readable>) {
+  const buffers: Buffer[] = [];
   readable = await readable;
   readable.on('data', buffer => {
-    data += buffer.toString();
+    buffers.push(buffer);
   });
   readable.resume();
   await once(readable, 'end')
-  return data;
+  return Buffer.concat(buffers);
 }

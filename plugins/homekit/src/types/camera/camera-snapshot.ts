@@ -1,78 +1,34 @@
+import { sleep } from "@scrypted/common/src/sleep";
 import sdk, { AudioSensor, Camera, Intercom, Logger, MotionSensor, ScryptedDevice, ScryptedInterface, VideoCamera } from "@scrypted/sdk";
-import throttle from 'lodash/throttle';
-import { SnapshotRequest, SnapshotRequestCallback } from "../../hap";
+import throttle from "lodash/throttle";
+import { ResourceRequestReason, SnapshotRequest, SnapshotRequestCallback } from "../../hap";
 import type { HomeKitPlugin } from "../../main";
 
 const { systemManager, mediaManager } = sdk;
 
 function recommendSnapshotPlugin(console: Console, log: Logger, message: string) {
-    if (systemManager.getDeviceById('@scrypted/snapshot'))
+    if (systemManager.getDeviceByName('@scrypted/snapshot'))
         return;
     console.log(message);
     log.a(message);
 }
 
 export function createSnapshotHandler(device: ScryptedDevice & VideoCamera & Camera & MotionSensor & AudioSensor & Intercom, storage: Storage, homekitPlugin: HomeKitPlugin, console: Console) {
-    let pendingPicture: Promise<Buffer>;
-
     const takePicture = async (request: SnapshotRequest) => {
-        if (pendingPicture)
-            return pendingPicture;
+        if (!device.interfaces.includes(ScryptedInterface.Camera))
+            throw new Error('Camera does not provide native snapshots. Please install the Snapshot Plugin.');
 
-        if (device.interfaces.includes(ScryptedInterface.Camera)) {
-            const media = await device.takePicture({
-                picture: {
-                    width: request.width,
-                    height: request.height,
-                }
-            });
-            pendingPicture = mediaManager.convertMediaObjectToBuffer(media, 'image/jpeg');
-        }
-        else {
-            pendingPicture = Promise.reject(new Error('Camera does not provide native snapshots. Please install the Snapshot Plugin.'));
-        }
-
-        const wrapped = pendingPicture;
-        pendingPicture = new Promise((resolve, reject) => {
-            let timedOut = false;
-            const timeout = setTimeout(() => {
-                timedOut = true;
-                pendingPicture = undefined;
-                recommendSnapshotPlugin(console, homekitPlugin.log, `${device.name} is offline or has slow snapshots. This will cause HomeKit to hang. Consider installing the Snapshot Plugin to keep HomeKit responsive. origin:/#/component/plugin/install/@scrypted/snapshot}`);
-                reject(new Error('snapshot timed out'));
-            }, 3000);
-
-            wrapped.then(picture => {
-                if (!timedOut) {
-                    pendingPicture = undefined;
-                    clearTimeout(timeout);
-                    resolve(picture)
-                }
-            })
-                .catch(e => {
-                    if (!timedOut) {
-                        pendingPicture = undefined;
-                        clearTimeout(timeout);
-                        reject(e);
-                    }
-                })
-        });
-
-        return pendingPicture;
+        const media = await device.takePicture({
+            reason: request.reason === ResourceRequestReason.EVENT ? 'event' : 'periodic',
+            picture: {
+                width: request.width,
+                height: request.height,
+            },
+        })
+        return await mediaManager.convertMediaObjectToBuffer(media, 'image/jpeg');
     }
 
-    const throttledTakePicture = throttle(takePicture, 9000, {
-        leading: true,
-        trailing: true,
-    });
-
-    function snapshotAll(request: SnapshotRequest) {
-        for (const snapshotThrottle of homekitPlugin.snapshotThrottles.values()) {
-            snapshotThrottle(request);
-        }
-    }
-
-    homekitPlugin.snapshotThrottles.set(device.id, throttledTakePicture);
+    homekitPlugin.snapshotThrottles.set(device.id, takePicture);
 
     async function handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback) {
         try {
@@ -92,10 +48,8 @@ export function createSnapshotHandler(device: ScryptedDevice & VideoCamera & Cam
             // fetch everything serially.
             // this call is not a bug, to force lodash to take a picture on the trailing edge,
             // throttle must be called twice.
-            snapshotAll(request);
-            snapshotAll(request);
 
-            callback(null, await throttledTakePicture(request));
+            callback(null, await takePicture(request));
         }
         catch (e) {
             console.error('snapshot error', e);

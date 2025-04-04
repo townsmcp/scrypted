@@ -1,5 +1,5 @@
 import { Entry } from "@scrypted/sdk";
-import { ValueID } from "@zwave-js/core";
+import type { ValueID } from "@zwave-js/core";
 import { BarrierState } from "zwave-js";
 import { ZwaveDeviceBase } from "./ZwaveDeviceBase";
 
@@ -15,7 +15,7 @@ export class EntryToBarrierOperator extends ZwaveDeviceBase implements Entry {
         this.entryOpen = (await cc.get()).currentState !== BarrierState.Closed;
     }
     static updateState(zwaveDevice: ZwaveDeviceBase, valueId: ValueID) {
-        zwaveDevice.entryOpen = zwaveDevice.getValue(valueId) !== 'Closed';
+        zwaveDevice.entryOpen = zwaveDevice.getValue(valueId) !== BarrierState.Closed;
     }
 }
 

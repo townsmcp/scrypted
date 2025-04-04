@@ -1,16 +1,13 @@
-import { StorageSettings } from "@scrypted/common/src/settings";
-import sdk, { MediaObject, MixinProvider, Readme, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoClip, VideoClipOptions, VideoClips } from "@scrypted/sdk";
+import sdk, { MediaObject, Readme, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoClip, VideoClipOptions, VideoClips } from "@scrypted/sdk";
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
 import checkDiskSpace from 'check-disk-space';
-import { canCameraMixin } from "./camera-mixin";
-import { HOMEKIT_MIXIN } from "./homekit-mixin";
 import { getSavePath, getVideoClip, getVideoClips, getVideoClipThumbnail, nukeClips, parseHksvId, pruneClips, removeVideoClip } from "./types/camera/camera-recording-files";
-import { ClipsMixin } from "./video-clips-mixin";
 
-const DAYS_TO_KEEP = 10;
+const DAYS_TO_KEEP = 3;
 const PRUNE_AGE = DAYS_TO_KEEP * 24 * 60 * 60 * 1000;
 const { systemManager } = sdk;
 
-export class VideoClipsMixinProvider extends ScryptedDeviceBase implements MixinProvider, Settings, Readme, VideoClips {
+export class VideoClipsMixinProvider extends ScryptedDeviceBase implements Settings, Readme, VideoClips {
     storageSettings = new StorageSettings(this, {
         reset: {
             title: 'Remove All Clips',
@@ -24,9 +21,7 @@ export class VideoClipsMixinProvider extends ScryptedDeviceBase implements Mixin
         }
     });
 
-    pruneInterval = setInterval(() => {
-        this.prune();
-    }, 60 * 60 * 1000);
+    pruneInterval: NodeJS.Timeout;
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -35,6 +30,13 @@ export class VideoClipsMixinProvider extends ScryptedDeviceBase implements Mixin
         this.toMimeType = ScryptedMimeTypes.MediaObject;
 
         this.prune();
+    }
+
+    resetPruneInterval() {
+        clearTimeout(this.pruneInterval);
+        this.pruneInterval = setInterval(() => {
+            this.prune();
+        }, 60 * 60 * 1000);
     }
 
     async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
@@ -72,10 +74,9 @@ export class VideoClipsMixinProvider extends ScryptedDeviceBase implements Mixin
         const diskSpace = await checkDiskSpace(savePath);
         let pruneAge = PRUNE_AGE;
         if (diskSpace.free < 10_000_000_000) {
-            pruneAge = 1 * 24 * 60 * 60 * 1000;
+            pruneAge = 1 * 60 * 60 * 1000;
             this.console.warn(`Low Disk space: ${savePath}`);
-            this.console.warn("Pruning videos older than 1 day to recover space.");
-            this.log.a('Low disk space.');
+            this.console.warn("Pruning videos older than 1 hour to recover space.");
         }
 
         pruneClips(pruneAge, this.console);
@@ -91,26 +92,5 @@ export class VideoClipsMixinProvider extends ScryptedDeviceBase implements Mixin
 
     putSetting(key: string, value: SettingValue): Promise<void> {
         return this.storageSettings.putSetting(key, value);
-    }
-
-    async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]> {
-        if (canCameraMixin(type, interfaces) && interfaces.includes(HOMEKIT_MIXIN)) {
-            return [
-                ScryptedInterface.VideoClips,
-            ];
-        }
-    }
-
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any; }): Promise<any> {
-        const ret = new ClipsMixin({
-            mixinDevice,
-            mixinDeviceInterfaces,
-            mixinDeviceState,
-            mixinProviderNativeId: this.nativeId,
-        })
-        return ret;
-    }
-
-    async releaseMixin(id: string, mixinDevice: any): Promise<void> {
     }
 }

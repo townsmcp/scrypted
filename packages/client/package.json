@@ -1,6 +1,6 @@
 {
   "name": "@scrypted/client",
-  "version": "1.0.25",
+  "version": "1.3.13",
   "description": "",
   "main": "dist/packages/client/src/index.js",
   "scripts": {
@@ -12,17 +12,18 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@types/adm-zip": "^0.4.34",
-    "@types/ip": "^1.1.0",
-    "@types/node": "^17.0.17"
+    "@types/ip": "^1.1.3",
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.18.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "@scrypted/types": "^0.5.12"
   },
   "dependencies": {
-    "@scrypted/types": "^0.0.49",
-    "adm-zip": "^0.5.9",
-    "axios": "^0.25.0",
-    "engine.io-client": "^6.2.2",
-    "linkfs": "^2.1.0",
-    "memfs": "^3.4.1",
-    "rimraf": "^3.0.2"
+    "engine.io-client": "^6.6.3",
+    "follow-redirects": "^1.15.9",
+    "rimraf": "^6.0.1"
   }
 }

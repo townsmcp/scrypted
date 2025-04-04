@@ -1,67 +1,112 @@
-name: Publish Scrypted
+name: Publish Scrypted Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "The npm tag used to build the Docker image. The tag will be resolved as a specific version on npm, and that will be used to version the docker image."
+        required: true
+      publish_tag:
+        description: "The versioned tag for the published Docker image. NPM will use the minor version, Docker should only specify a patch version."
+        required: false
   release:
     types: [published]
 
 jobs:
-  push_to_registry:
+  build:
     name: Push Docker image to Docker Hub
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+#     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ["16-bullseye", "18-bullseye"]
-        variant: ["", ".lite"]
+        BASE: [
+          ["noble-nvidia", ".s6", "noble-nvidia"],
+          ["noble-full", ".s6", "noble-full"],
+          ["noble-lite", "", "noble-lite"],
+          ["noble-lite", ".router", "noble-router"],
+        ]
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v2
-      
-      - name: get-npm-version
-        id: package-version
-        uses: martinbeentjes/npm-get-version-action@master
-        with:
-          path: server
+        uses: actions/checkout@v3
 
-      - name: Get current date
-        id: date
-        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+      - name: NPM Package Request
+        id: npm-request
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://registry.npmjs.org/@scrypted/server'
+          method: 'GET'
+
+      - name: Set NPM Version
+        id: package-version
+        run: echo "NPM_VERSION=${{ fromJson(steps.npm-request.outputs.response)['dist-tags'][ github.event.inputs.tag] }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
+
+      - name: Set up SSH
+        uses: MrSquaare/ssh-setup-action@v2
+        with:
+          host: ${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+          private-key: ${{ secrets.DOCKER_SSH_PRIVATE_KEY }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-        
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_AMD64 }}
+              platforms: linux/amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/arm64
+          append: |
+            - endpoint: ssh://${{ secrets.DOCKER_SSH_USER }}@${{ secrets.DOCKER_SSH_HOST_ARM64 }}
+              platforms: linux/arm64
+
       - name: Login to Docker Hub
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login to Github Container Registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image (scrypted)
-        uses: docker/build-push-action@v2
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
         with:
-          build-args: BASE=${{ matrix.node }}
-          context: .
-          file: docker/Dockerfile${{ matrix.variant }}
-          platforms: linux/amd64,linux/arm64,linux/armhf
+          build-args: |
+            BASE=${{ matrix.BASE[0] }}
+            SCRYPTED_INSTALL_VERSION=${{ steps.package-version.outputs.NPM_VERSION }}
+          context: install/docker/
+          file: install/docker/Dockerfile${{ matrix.BASE[1] }}
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            koush/scrypted:${{ matrix.node }}${{ matrix.variant }}
-            ${{ format('koush/scrypted:v{0}{1}', steps.package-version.outputs.current-version, matrix.variant) || '' }}
-            ${{ matrix.node == '16-bullseye' && matrix.variant == '' && 'koush/scrypted:latest' || '' }}
-            ${{ matrix.node == '16-bullseye' && matrix.variant == '.lite' && 'koush/scrypted:lite' || '' }}
-            ghcr.io/koush/scrypted:${{ matrix.node }}${{ matrix.variant }}
-            ${{ format('ghcr.io/koush/scrypted:v{0}{1}', steps.package-version.outputs.current-version, matrix.variant) || '' }}
-            ${{ matrix.node == '16-bullseye' && matrix.variant == '' && 'ghcr.io/koush/scrypted:latest' || '' }}
-            ${{ matrix.node == '16-bullseye' && matrix.variant == '.lite' && 'ghcr.io/koush/scrypted:lite' || '' }}
+            ${{ format('koush/scrypted:v{1}-{0}', matrix.BASE[2], github.event.inputs.publish_tag || steps.package-version.outputs.NPM_VERSION) }}
+            ${{ matrix.BASE[2] == 'noble-full' && format('koush/scrypted:{0}', github.event.inputs.tag) || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-nvidia' && 'koush/scrypted:nvidia' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-full' && 'koush/scrypted:full' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-lite' && matrix.BASE[1] == '' && 'koush/scrypted:lite' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-router' && 'koush/scrypted:router' || '' }}
+
+            ${{ format('ghcr.io/koush/scrypted:v{1}-{0}', matrix.BASE[0], github.event.inputs.publish_tag || steps.package-version.outputs.NPM_VERSION) }}
+            ${{ matrix.BASE[2] == 'noble-full' && format('ghcr.io/koush/scrypted:{0}', github.event.inputs.tag) || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-nvidia' && 'ghcr.io/koush/scrypted:nvidia' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-full' && 'ghcr.io/koush/scrypted:full' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-lite' && matrix.BASE[1] == '' && 'ghcr.io/koush/scrypted:lite' || '' }}
+            ${{ github.event.inputs.tag == 'latest' && matrix.BASE[2] == 'noble-lite' && 'ghcr.io/koush/scrypted:router' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

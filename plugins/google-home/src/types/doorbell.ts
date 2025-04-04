@@ -14,7 +14,12 @@ addSupportedType({
         ret.traits.push('action.devices.traits.ObjectDetection');
         ret.attributes = {
             cameraStreamSupportedProtocols: [
-                "progressive_mp4", "hls", "dash", "smooth_stream"
+                // this may be supported on gen 2 hub?
+                "progressive_mp4",
+                // "hls",
+                // "dash",
+                // "smooth_stream",
+                "webrtc",
             ],
             cameraStreamNeedAuthToken: true,
             cameraStreamNeedDrmEncryption: false
@@ -25,25 +30,9 @@ addSupportedType({
         const ret = queryResponse(device);
         return ret;
     },
-    async notifications(device: ScryptedDevice & BinarySensor, notificationsState: any) {
-        if (!device.binaryState)
+    async notifications(device: ScryptedDevice & BinarySensor, interfaces: Set<string>) {
+        if (!interfaces?.has(ScryptedInterface.BinarySensor) || !device.binaryState)
             return {};
-
-        // store and compare the timestamp of this binary state 
-        const detectionTimestamp = systemManager.getSystemState()?.[device.id]?.[ScryptedInterfaceProperty.binaryState]?.stateTime;
-
-        // can this happen?
-        if (!detectionTimestamp) {
-            console.warn(ScryptedInterfaceProperty.binaryState, 'timestamp is missing?')
-            return {};
-        }
-
-        // existing event.
-        if (notificationsState[ScryptedInterfaceProperty.binaryState] === detectionTimestamp)
-            return {};
-
-        // new event
-        notificationsState[ScryptedInterfaceProperty.binaryState] = detectionTimestamp;
 
         const ret = {
             ObjectDetection: {
@@ -51,7 +40,7 @@ addSupportedType({
                     "unfamiliar": 1
                 },
                 priority: 0,
-                detectionTimestamp,
+                detectionTimestamp: Date.now(),
             }
         }
         return ret;

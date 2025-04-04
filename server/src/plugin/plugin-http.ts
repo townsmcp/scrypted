@@ -1,7 +1,7 @@
 import { HttpRequest } from '@scrypted/types';
 import bodyParser from 'body-parser';
 import { Request, Response, Router } from 'express';
-import { ServerResponse, IncomingHttpHeaders } from 'http';
+import { IncomingHttpHeaders, ServerResponse } from 'http';
 import WebSocket, { Server as WebSocketServer } from "ws";
 
 export function isConnectionUpgrade(headers: IncomingHttpHeaders) {
@@ -40,6 +40,7 @@ export abstract class PluginHttp<T> {
     abstract handleRequestEndpoint(req: Request, res: Response, endpointRequest: HttpRequest, pluginData: T): void;
     abstract getEndpointPluginData(req: Request, endpoint: string, isUpgrade: boolean, isEngineIOEndpoint: boolean): Promise<T>;
     abstract handleWebSocket(endpoint: string, httpRequest: HttpRequest, ws: WebSocket, pluginData: T): Promise<void>;
+    abstract checkUpgrade(req: Request, res: Response, pluginData: T): void;
 
     async endpointHandler(req: Request, res: Response, isPublicEndpoint: boolean, isEngineIOEndpoint: boolean,
         handler: (req: Request, res: Response, endpointRequest: HttpRequest, pluginData: T) => void) {
@@ -54,10 +55,32 @@ export abstract class PluginHttp<T> {
                 socket.destroy();
             }
             else {
+                res.header('Content-Type', 'text/plain');
                 res.status(code);
                 res.send(message);
             }
         };
+
+        const { owner, pkg } = req.params;
+        let endpoint = pkg;
+        if (owner)
+            endpoint = `@${owner}/${endpoint}`;
+        const pluginData = await this.getEndpointPluginData(req, endpoint, isUpgrade, isEngineIOEndpoint);
+
+        if (!pluginData) {
+            end(404, `Not Found (plugin or device "${endpoint}" not found)`);
+            return;
+        }
+
+        if (isEngineIOEndpoint && isUpgrade) {
+            this.checkUpgrade(req, res, pluginData);
+        }
+
+        if (isEngineIOEndpoint && req.method === 'OPTIONS') {
+            res.send(204);
+            return;
+        }
+
 
         if (!isPublicEndpoint && !res.locals.username) {
             end(401, 'Not Authorized');
@@ -65,19 +88,8 @@ export abstract class PluginHttp<T> {
             return;
         }
 
-        const { owner, pkg } = req.params;
-        let endpoint = pkg;
-        if (owner)
-            endpoint = `@${owner}/${endpoint}`;
-
         if (isUpgrade && req.headers.upgrade?.toLowerCase() !== 'websocket') {
-            end(404, 'Not Found');
-            return;
-        }
-
-        const pluginData = await this.getEndpointPluginData(req, endpoint, isUpgrade, isEngineIOEndpoint);
-        if (!pluginData) {
-            end(404, 'Not Found');
+            end(404, 'Not Found (unknown upgrade protocol)');
             return;
         }
 
@@ -89,17 +101,14 @@ export abstract class PluginHttp<T> {
 
         const httpRequest: HttpRequest = {
             body,
-            headers: req.headers,
+            headers: req.headers as any,
             method: req.method,
             rootPath,
             url: req.url,
             isPublicEndpoint,
             username: res.locals.username,
+            aclId: res.locals.aclId,
         };
-
-        if (isEngineIOEndpoint && !isUpgrade && isPublicEndpoint) {
-            res.header("Access-Control-Allow-Origin", '*');
-        }
 
         if (!isEngineIOEndpoint && isUpgrade) {
             try {
@@ -114,6 +123,7 @@ export abstract class PluginHttp<T> {
                 });
             }
             catch (e) {
+                res.header('Content-Type', 'text/plain');
                 res.status(500);
                 res.send(e.toString());
                 console.error(e);
@@ -124,6 +134,7 @@ export abstract class PluginHttp<T> {
                 handler(req, res, httpRequest, pluginData);
             }
             catch (e) {
+                res.header('Content-Type', 'text/plain');
                 res.status(500);
                 res.send(e.toString());
                 console.error(e);
